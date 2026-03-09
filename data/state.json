@@ -1,0 +1,20 @@
+{
+  "wallets": {
+    "0xcb3143ee858e14d0b3fe40ffeaea78416e646b02": {
+      "label": "Wallet 1",
+      "addedAt": 1772983703739,
+      "alerts": true,
+      "threshold": 50
+    },
+    "0x88c4919de76e526d55a32c1f8afb439dd1f1129a": {
+      "label": "500k All Time",
+      "addedAt": 1772984273214,
+      "alerts": true,
+      "threshold": 50
+    }
+  },
+  "lastSeen": {
+    "0xcb3143ee858e14d0b3fe40ffeaea78416e646b02": null,
+    "0x88c4919de76e526d55a32c1f8afb439dd1f1129a": null
+  }
+}
