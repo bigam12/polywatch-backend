@@ -271,6 +271,24 @@ async function fetchClosedPositions(address) {
   return all;
 }
 
+function computeStats(positions) {
+  let totalPnl = 0, totalCost = 0, wins = 0, losses = 0;
+  let winAmounts = [], lossAmounts = [], bestTrade = 0, worstTrade = 0;
+  positions.forEach(p => {
+    const pnl = parseFloat(p.realizedPnl || 0);
+    const bought = parseFloat(p.totalBought || 0);
+    totalPnl += pnl; totalCost += bought;
+    if (pnl > 0.01) { wins++; winAmounts.push(pnl); if (pnl > bestTrade) bestTrade = pnl; }
+    else if (pnl < -0.01) { losses++; lossAmounts.push(pnl); if (pnl < worstTrade) worstTrade = pnl; }
+  });
+  const tradeCount = wins + losses;
+  const winRate = tradeCount > 0 ? (wins / tradeCount) * 100 : 0;
+  const avgWin = wins > 0 ? winAmounts.reduce((a,b)=>a+b,0) / wins : 0;
+  const avgLoss = losses > 0 ? lossAmounts.reduce((a,b)=>a+b,0) / losses : 0;
+  const roi = totalCost > 0 ? (totalPnl / totalCost) * 100 : 0;
+  return { profit: totalPnl, volume: totalCost, totalProfit: totalPnl, roi, winRate, tradeCount, wins, losses, avgWin, avgLoss, bestTrade, worstTrade };
+}
+
 async function fetchPnL(address) {
   // Return cached result if still fresh
   const cached = pnlCache[address];
@@ -282,63 +300,33 @@ async function fetchPnL(address) {
       fetchPositions(address)
     ]);
 
-    if (!closedPositions.length && !openPositions.length) {
-      return { profit: 0, volume: 0, totalProfit: 0, roi: 0, winRate: 0, tradeCount: 0, wins: 0, losses: 0, avgWin: 0, avgLoss: 0, bestTrade: 0, worstTrade: 0, portfolioValue: 0 };
+    // Portfolio value from open positions
+    let portfolioValue = 0;
+    openPositions.forEach(p => { portfolioValue += parseFloat(p.currentValue || p.value || 0); });
+
+    if (!closedPositions.length) {
+      const empty = { profit:0, volume:0, totalProfit:0, roi:0, winRate:0, tradeCount:0, wins:0, losses:0, avgWin:0, avgLoss:0, bestTrade:0, worstTrade:0 };
+      return { ...empty, portfolioValue, periods: { alltime: { ...empty, portfolioValue }, monthly: { ...empty, portfolioValue }, weekly: { ...empty, portfolioValue }, daily: { ...empty, portfolioValue } } };
     }
 
-    // Wins/losses/realizedPnl from closed (resolved) positions — accurate data
-    let totalRealizedPnl = 0;
-    let totalCost = 0;
-    let wins = 0;
-    let losses = 0;
-    let winAmounts = [];
-    let lossAmounts = [];
-    let bestTrade = 0;
-    let worstTrade = 0;
+    // Compute stats for each time window from the same fetched positions — no extra API calls
+    const now = Math.floor(Date.now() / 1000); // Polymarket timestamps are Unix seconds
+    const alltime = computeStats(closedPositions);
+    const monthly = computeStats(closedPositions.filter(p => p.timestamp >= now - 2592000));
+    const weekly  = computeStats(closedPositions.filter(p => p.timestamp >= now - 604800));
+    const daily   = computeStats(closedPositions.filter(p => p.timestamp >= now - 86400));
 
-    closedPositions.forEach(p => {
-      const realizedPnl = parseFloat(p.realizedPnl || 0);
-      const bought = parseFloat(p.totalBought || 0);
-      totalRealizedPnl += realizedPnl;
-      totalCost += bought;
-      if (realizedPnl > 0.01) {
-        wins++;
-        winAmounts.push(realizedPnl);
-        if (realizedPnl > bestTrade) bestTrade = realizedPnl;
-      } else if (realizedPnl < -0.01) {
-        losses++;
-        lossAmounts.push(realizedPnl);
-        if (realizedPnl < worstTrade) worstTrade = realizedPnl;
-      }
-    });
+    console.log('📊 PnL:', { closedCount: closedPositions.length, alltime: { winRate: alltime.winRate.toFixed(1), wins: alltime.wins, losses: alltime.losses }, monthly: { wins: monthly.wins, losses: monthly.losses }, weekly: { wins: weekly.wins }, daily: { wins: daily.wins } });
 
-    // Portfolio value from open positions
-    let totalPortfolioValue = 0;
-    openPositions.forEach(p => {
-      totalPortfolioValue += parseFloat(p.currentValue || p.value || 0);
-    });
-
-    const tradeCount = wins + losses;
-    const winRate = tradeCount > 0 ? (wins / tradeCount) * 100 : 0;
-    const avgWin = wins > 0 ? winAmounts.reduce((a,b)=>a+b,0) / wins : 0;
-    const avgLoss = losses > 0 ? lossAmounts.reduce((a,b)=>a+b,0) / losses : 0;
-    const roi = totalCost > 0 ? (totalRealizedPnl / totalCost) * 100 : 0;
-
-    console.log('📊 PnL:', { closedCount: closedPositions.length, openCount: openPositions.length, totalRealizedPnl, roi: roi.toFixed(1), winRate: winRate.toFixed(1), wins, losses });
     const result = {
-      profit: totalRealizedPnl,
-      volume: totalCost,
-      totalProfit: totalRealizedPnl,
-      roi,
-      winRate,
-      tradeCount,
-      wins,
-      losses,
-      avgWin,
-      avgLoss,
-      bestTrade,
-      worstTrade,
-      portfolioValue: totalPortfolioValue
+      ...alltime,
+      portfolioValue,
+      periods: {
+        alltime:  { ...alltime,  portfolioValue },
+        monthly:  { ...monthly,  portfolioValue },
+        weekly:   { ...weekly,   portfolioValue },
+        daily:    { ...daily,    portfolioValue }
+      }
     };
     pnlCache[address] = { data: result, expiry: Date.now() + PNL_CACHE_TTL };
     return result;
