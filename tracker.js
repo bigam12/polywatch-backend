@@ -23,6 +23,8 @@ let walletsCol;
 
 let recentMarketTrades = {};
 let patternData = {};
+const pnlCache = {}; // address -> { data, expiry }
+const PNL_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 async function connectDB() {
   if (!MONGODB_URI) { console.warn('⚠️  No MONGODB_URI set'); return; }
@@ -252,11 +254,28 @@ async function fetchPositions(address) {
 }
 
 async function fetchClosedPositions(address) {
-  try { const r = await axios.get(`${DATA_API}/closed-positions`, { params: { user: address, limit: 50, sortBy: 'TIMESTAMP', sortDirection: 'DESC' }, timeout: 10000 }); return r.data || []; }
-  catch (e) { return []; }
+  const all = [];
+  const limit = 50;
+  const maxPages = 20; // cap at 1000 positions
+  for (let page = 0; page < maxPages; page++) {
+    try {
+      const r = await axios.get(`${DATA_API}/closed-positions`, {
+        params: { user: address, limit, offset: page * limit, sortBy: 'TIMESTAMP', sortDirection: 'DESC' },
+        timeout: 10000
+      });
+      const data = r.data || [];
+      all.push(...data);
+      if (data.length < limit) break; // no more pages
+    } catch (e) { break; }
+  }
+  return all;
 }
 
 async function fetchPnL(address) {
+  // Return cached result if still fresh
+  const cached = pnlCache[address];
+  if (cached && Date.now() < cached.expiry) return cached.data;
+
   try {
     const [closedPositions, openPositions] = await Promise.all([
       fetchClosedPositions(address),
@@ -306,7 +325,7 @@ async function fetchPnL(address) {
     const roi = totalCost > 0 ? (totalRealizedPnl / totalCost) * 100 : 0;
 
     console.log('📊 PnL:', { closedCount: closedPositions.length, openCount: openPositions.length, totalRealizedPnl, roi: roi.toFixed(1), winRate: winRate.toFixed(1), wins, losses });
-    return {
+    const result = {
       profit: totalRealizedPnl,
       volume: totalCost,
       totalProfit: totalRealizedPnl,
@@ -321,6 +340,8 @@ async function fetchPnL(address) {
       worstTrade,
       portfolioValue: totalPortfolioValue
     };
+    pnlCache[address] = { data: result, expiry: Date.now() + PNL_CACHE_TTL };
+    return result;
   }
   catch (e) {
     console.log('⚠️  Failed to calculate PnL:', e.message);
