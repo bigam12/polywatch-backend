@@ -252,7 +252,7 @@ async function fetchPositions(address) {
 }
 
 async function fetchClosedPositions(address) {
-  try { const r = await axios.get(`${DATA_API}/closed-positions`, { params: { user: address, limit: 50, sortBy: 'REALIZEDPNL', sortDirection: 'DESC' }, timeout: 10000 }); return r.data || []; }
+  try { const r = await axios.get(`${DATA_API}/closed-positions`, { params: { user: address, limit: 50, sortBy: 'TIMESTAMP', sortDirection: 'DESC' }, timeout: 10000 }); return r.data || []; }
   catch (e) { return []; }
 }
 
