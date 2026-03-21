@@ -251,16 +251,25 @@ async function fetchPositions(address) {
   catch (e) { return []; }
 }
 
+async function fetchClosedPositions(address) {
+  try { const r = await axios.get(`${DATA_API}/closed-positions`, { params: { user: address, limit: 50, sortBy: 'REALIZEDPNL', sortDirection: 'DESC' }, timeout: 10000 }); return r.data || []; }
+  catch (e) { return []; }
+}
+
 async function fetchPnL(address) {
   try {
-    const positions = await fetchPositions(address);
-    if (!positions.length) return { profit: 0, volume: 0, totalProfit: 0, roi: 0, winRate: 0, tradeCount: 0, wins: 0, losses: 0, avgWin: 0, avgLoss: 0, bestTrade: 0, worstTrade: 0, portfolioValue: 0 };
+    const [closedPositions, openPositions] = await Promise.all([
+      fetchClosedPositions(address),
+      fetchPositions(address)
+    ]);
 
-    // Log first position to show actual API field names
-    console.log('📋 Sample position fields:', JSON.stringify(positions[0]));
+    if (!closedPositions.length && !openPositions.length) {
+      return { profit: 0, volume: 0, totalProfit: 0, roi: 0, winRate: 0, tradeCount: 0, wins: 0, losses: 0, avgWin: 0, avgLoss: 0, bestTrade: 0, worstTrade: 0, portfolioValue: 0 };
+    }
 
+    // Wins/losses/realizedPnl from closed (resolved) positions — accurate data
+    let totalRealizedPnl = 0;
     let totalCost = 0;
-    let totalPortfolioValue = 0;
     let wins = 0;
     let losses = 0;
     let winAmounts = [];
@@ -268,50 +277,48 @@ async function fetchPnL(address) {
     let bestTrade = 0;
     let worstTrade = 0;
 
-    positions.forEach(p => {
-      const size = parseFloat(p.size || 0);
-      const avgPrice = parseFloat(p.avgPrice || p.initialOdds || p.purchasePrice || 0);
-      const currentVal = parseFloat(p.currentValue || p.value || 0);
-      // Cost = totalBought if available, else size * avgPrice
-      const cost = parseFloat(p.totalBought || 0) || (size * avgPrice);
-
-      totalPortfolioValue += currentVal;
-      totalCost += cost;
-
-      // Win/loss = is this position currently in profit vs what was paid
-      const positionPnl = currentVal - cost;
-      if (positionPnl > 0.01) {
+    closedPositions.forEach(p => {
+      const realizedPnl = parseFloat(p.realizedPnl || 0);
+      const bought = parseFloat(p.totalBought || 0);
+      totalRealizedPnl += realizedPnl;
+      totalCost += bought;
+      if (realizedPnl > 0.01) {
         wins++;
-        winAmounts.push(positionPnl);
-        if (positionPnl > bestTrade) bestTrade = positionPnl;
-      } else if (positionPnl < -0.01) {
+        winAmounts.push(realizedPnl);
+        if (realizedPnl > bestTrade) bestTrade = realizedPnl;
+      } else if (realizedPnl < -0.01) {
         losses++;
-        lossAmounts.push(positionPnl);
-        if (positionPnl < worstTrade) worstTrade = positionPnl;
+        lossAmounts.push(realizedPnl);
+        if (realizedPnl < worstTrade) worstTrade = realizedPnl;
       }
     });
 
-    const totalProfit = totalPortfolioValue - totalCost;
-    const tradeCount = positions.length;
+    // Portfolio value from open positions
+    let totalPortfolioValue = 0;
+    openPositions.forEach(p => {
+      totalPortfolioValue += parseFloat(p.currentValue || p.value || 0);
+    });
+
+    const tradeCount = wins + losses;
     const winRate = tradeCount > 0 ? (wins / tradeCount) * 100 : 0;
     const avgWin = wins > 0 ? winAmounts.reduce((a,b)=>a+b,0) / wins : 0;
     const avgLoss = losses > 0 ? lossAmounts.reduce((a,b)=>a+b,0) / losses : 0;
-    const roi = totalCost > 0 ? (totalProfit / totalCost) * 100 : 0;
+    const roi = totalCost > 0 ? (totalRealizedPnl / totalCost) * 100 : 0;
 
-    console.log('📊 PnL calculated from positions:', { totalPortfolioValue, totalCost, totalProfit, roi, winRate, tradeCount, wins, losses });
+    console.log('📊 PnL:', { closedCount: closedPositions.length, openCount: openPositions.length, totalRealizedPnl, roi: roi.toFixed(1), winRate: winRate.toFixed(1), wins, losses });
     return {
-      profit: totalProfit,
+      profit: totalRealizedPnl,
       volume: totalCost,
-      totalProfit: totalProfit,
-      roi: roi,
-      winRate: winRate,
-      tradeCount: tradeCount,
-      wins: wins,
-      losses: losses,
-      avgWin: avgWin,
-      avgLoss: avgLoss,
-      bestTrade: bestTrade,
-      worstTrade: worstTrade,
+      totalProfit: totalRealizedPnl,
+      roi,
+      winRate,
+      tradeCount,
+      wins,
+      losses,
+      avgWin,
+      avgLoss,
+      bestTrade,
+      worstTrade,
       portfolioValue: totalPortfolioValue
     };
   }
