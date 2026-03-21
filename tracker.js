@@ -252,8 +252,73 @@ async function fetchPositions(address) {
 }
 
 async function fetchPnL(address) {
-  try { const r = await axios.get(`${DATA_API}/portfolio-profit-and-loss`, { params: { user: address }, timeout: 10000 }); return r.data; }
-  catch (e) { try { const r2 = await axios.get(`${DATA_API}/profile`, { params: { address }, timeout: 10000 }); return r2.data; } catch { return null; } }
+  try {
+    const positions = await fetchPositions(address);
+    if (!positions.length) return { profit: 0, volume: 0, totalProfit: 0, roi: 0, winRate: 0, tradeCount: 0, wins: 0, losses: 0, avgWin: 0, avgLoss: 0, bestTrade: 0, worstTrade: 0, portfolioValue: 0 };
+
+    // Log first position to show actual API field names
+    console.log('📋 Sample position fields:', JSON.stringify(positions[0]));
+
+    let totalCost = 0;
+    let totalPortfolioValue = 0;
+    let wins = 0;
+    let losses = 0;
+    let winAmounts = [];
+    let lossAmounts = [];
+    let bestTrade = 0;
+    let worstTrade = 0;
+
+    positions.forEach(p => {
+      const size = parseFloat(p.size || 0);
+      const avgPrice = parseFloat(p.avgPrice || p.initialOdds || p.purchasePrice || 0);
+      const currentVal = parseFloat(p.currentValue || p.value || 0);
+      // Cost = totalBought if available, else size * avgPrice
+      const cost = parseFloat(p.totalBought || 0) || (size * avgPrice);
+
+      totalPortfolioValue += currentVal;
+      totalCost += cost;
+
+      // Win/loss = is this position currently in profit vs what was paid
+      const positionPnl = currentVal - cost;
+      if (positionPnl > 0.01) {
+        wins++;
+        winAmounts.push(positionPnl);
+        if (positionPnl > bestTrade) bestTrade = positionPnl;
+      } else if (positionPnl < -0.01) {
+        losses++;
+        lossAmounts.push(positionPnl);
+        if (positionPnl < worstTrade) worstTrade = positionPnl;
+      }
+    });
+
+    const totalProfit = totalPortfolioValue - totalCost;
+    const tradeCount = positions.length;
+    const winRate = tradeCount > 0 ? (wins / tradeCount) * 100 : 0;
+    const avgWin = wins > 0 ? winAmounts.reduce((a,b)=>a+b,0) / wins : 0;
+    const avgLoss = losses > 0 ? lossAmounts.reduce((a,b)=>a+b,0) / losses : 0;
+    const roi = totalCost > 0 ? (totalProfit / totalCost) * 100 : 0;
+
+    console.log('📊 PnL calculated from positions:', { totalPortfolioValue, totalCost, totalProfit, roi, winRate, tradeCount, wins, losses });
+    return {
+      profit: totalProfit,
+      volume: totalCost,
+      totalProfit: totalProfit,
+      roi: roi,
+      winRate: winRate,
+      tradeCount: tradeCount,
+      wins: wins,
+      losses: losses,
+      avgWin: avgWin,
+      avgLoss: avgLoss,
+      bestTrade: bestTrade,
+      worstTrade: worstTrade,
+      portfolioValue: totalPortfolioValue
+    };
+  }
+  catch (e) {
+    console.log('⚠️  Failed to calculate PnL:', e.message);
+    return null;
+  }
 }
 
 async function fetchMarketQuestion(conditionId) {
@@ -366,7 +431,12 @@ function startApiServer() {
       if (path==='/consensus') return res.end(JSON.stringify(recentMarketTrades));
       if (path==='/activity') { const a=url.searchParams.get('address'); return res.end(JSON.stringify(a?await fetchActivity(a,20):[])); }
       if (path==='/positions') { const a=url.searchParams.get('address'); return res.end(JSON.stringify(a?await fetchPositions(a):[])); }
-      if (path==='/pnl') { const a=url.searchParams.get('address'); return res.end(JSON.stringify(a?await fetchPnL(a)||{}:{})); }
+      if (path==='/pnl') {
+        const a=url.searchParams.get('address');
+        const pnlData = a ? await fetchPnL(a) : null;
+        console.log(`🔗 /pnl endpoint called for ${a}, response:`, pnlData);
+        return res.end(JSON.stringify(pnlData||{}));
+      }
       if (path==='/health') return res.end(JSON.stringify({status:'ok',tracked:Object.keys(state.wallets).length,uptime:process.uptime()}));
       res.statusCode=404; res.end(JSON.stringify({error:'not found'}));
     } catch(e) { res.statusCode=500; res.end(JSON.stringify({error:e.message})); }
