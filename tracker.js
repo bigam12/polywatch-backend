@@ -30,6 +30,7 @@ const PNL_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 // ── Leaderboard + AI agent pipeline ──────────────────────────────────────────
 let leaderboardWallets = {};   // address -> { rank, profit, label }
 let pendingTrades = [];        // whale trades queued for AI analysis
+let signalsCache = [];         // in-memory fallback for signals (last 100)
 const WHALE_MIN_SIZE = parseFloat(process.env.WHALE_MIN_SIZE || '500');
 const LEADERBOARD_SYNC_INTERVAL = 60 * 60 * 1000; // 1 hour
 const SCANNER_INTERVAL = 60 * 1000; // 1 minute
@@ -509,7 +510,14 @@ function startApiServer() {
       if (path==='/signals' && req.method==='POST') {
         const signal = JSON.parse(await readBody(req));
         signal.createdAt = Date.now();
-        if (signalsCol) await signalsCol.insertOne(signal);
+        // Always store in memory first (survives MongoDB failures)
+        signalsCache.unshift(signal);
+        if (signalsCache.length > 100) signalsCache = signalsCache.slice(0, 100);
+        // Persist to MongoDB
+        if (signalsCol) {
+          try { await signalsCol.insertOne({ ...signal }); }
+          catch(e) { console.warn('⚠️  Signal MongoDB save failed:', e.message); }
+        }
         // Mark associated trades as analyzed
         if (Array.isArray(signal.tradeIds)) {
           signal.tradeIds.forEach(id => {
@@ -537,9 +545,15 @@ function startApiServer() {
 
       if (path==='/signals' && req.method==='GET') {
         const limit = parseInt(url.searchParams.get('limit') || '20');
-        const signals = signalsCol
-          ? await signalsCol.find({}).sort({ createdAt: -1 }).limit(limit).toArray()
-          : [];
+        let signals = [];
+        if (signalsCol) {
+          try {
+            const docs = await signalsCol.find({}).sort({ createdAt: -1 }).limit(limit).toArray();
+            signals = docs.map(d => { const { _id, ...rest } = d; return rest; });
+          } catch(e) { console.warn('⚠️  Signal MongoDB read failed:', e.message); }
+        }
+        // Fall back to in-memory cache if MongoDB returned nothing
+        if (!signals.length) signals = signalsCache.slice(0, limit);
         return res.end(JSON.stringify(signals));
       }
       res.statusCode=404; res.end(JSON.stringify({error:'not found'}));
