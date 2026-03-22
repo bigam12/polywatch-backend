@@ -501,7 +501,7 @@ function startApiServer() {
         const unanalyzed = pendingTrades.filter(t => !t.analyzed);
         // Also include recentMarketTrades flattened — the existing consensus data
         const recentFlat = Object.entries(recentMarketTrades).flatMap(([marketId, trades]) =>
-          trades.map(t => ({ ...t, id: `rmt_${marketId}_${t.address}_${t.time}`, analyzed: false, source: 'consensus' }))
+          trades.map(t => ({ ...t, conditionId: marketId, id: `rmt_${marketId}_${t.address}_${t.time}`, analyzed: false, source: 'consensus' }))
         );
         const combined = [...unanalyzed, ...recentFlat];
         return res.end(JSON.stringify(combined));
@@ -527,12 +527,23 @@ function startApiServer() {
         }
         // Telegram alert for high-confidence signals
         if (bot && TELEGRAM_CHAT_ID && (signal.confidence || 0) >= 70) {
-          const emoji = signal.strategy === 'whale' ? '🐋' : signal.strategy === 'arbitrage' ? '⚡' : '🎯';
-          const msg = `${emoji} *AI Signal — ${(signal.strategy||'').toUpperCase()}*\n\n` +
-            `📊 _${(signal.market||'').slice(0,80)}_\n\n` +
-            `Direction: *${signal.direction}*\nConfidence: *${signal.confidence}%*\n\n` +
-            `${(signal.reasoning||'').slice(0,200)}`;
-          bot.sendMessage(TELEGRAM_CHAT_ID, msg, { parse_mode: 'Markdown' }).catch(() => {});
+          const strategyEmoji = { whale: '🐋', arbitrage: '⚡', near_certainty: '🎯' }[signal.strategy] || '📡';
+          const dirEmoji = signal.direction === 'YES' ? '🟢' : signal.direction === 'NO' ? '🔴' : '🔵';
+          const bar = '█'.repeat(Math.round((signal.confidence||0) / 10)) + '░'.repeat(10 - Math.round((signal.confidence||0) / 10));
+          const stratLabel = { whale: 'WHALE CONVERGENCE', arbitrage: 'ARBITRAGE', near_certainty: 'CONTRARIAN FADE' }[signal.strategy] || signal.strategy.toUpperCase();
+          // Build Polymarket URL
+          const slug = signal.slug || '';
+          const url = slug
+            ? `https://polymarket.com/event/${slug}`
+            : `https://polymarket.com/search?q=${encodeURIComponent((signal.market||'').slice(0,50))}`;
+          const msg =
+            `${strategyEmoji} *${stratLabel}*\n\n` +
+            `📊 _${(signal.market||'').slice(0,90)}_\n\n` +
+            `${dirEmoji} Trade: *${signal.direction}*\n` +
+            `Confidence: *${signal.confidence}%*  ${bar}\n\n` +
+            `💡 ${(signal.reasoning||'').slice(0,220)}\n\n` +
+            `[👉 Trade on Polymarket](${url})`;
+          bot.sendMessage(TELEGRAM_CHAT_ID, msg, { parse_mode: 'Markdown', disable_web_page_preview: false }).catch(() => {});
         }
         return res.end(JSON.stringify({ success: true }));
       }
