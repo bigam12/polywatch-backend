@@ -482,10 +482,11 @@ function startApiServer() {
         console.log(`🔗 /pnl endpoint called for ${a}, response:`, pnlData);
         return res.end(JSON.stringify(pnlData||{}));
       }
-      if (path==='/health') return res.end(JSON.stringify({status:'ok',tracked:Object.keys(state.wallets).length,leaderboard:Object.keys(leaderboardWallets).length,pendingTrades:pendingTrades.filter(t=>!t.analyzed).length,uptime:process.uptime()}));
+      if (path==='/health') return res.end(JSON.stringify({status:'ok',tracked:Object.keys(state.wallets).length,discovered:Object.keys(discoveredWallets).length,scanPool:Object.keys(state.wallets).length+Object.keys(discoveredWallets).length,pendingTrades:pendingTrades.filter(t=>!t.analyzed).length,uptime:process.uptime()}));
 
       // ── AI agent pipeline endpoints ─────────────────────────────────────────
       if (path==='/leaderboard' && req.method==='GET') {
+        await syncLeaderboard(); // always fresh
         return res.end(JSON.stringify(
           Object.entries(leaderboardWallets)
             .map(([addr, data]) => ({ address: addr, ...data }))
