@@ -20,11 +20,28 @@ const GAMMA_API = 'https://gamma-api.polymarket.com';
 
 let state = { wallets: {}, lastSeen: {} };
 let walletsCol;
+let signalsCol;
 
 let recentMarketTrades = {};
 let patternData = {};
 const pnlCache = {}; // address -> { data, expiry }
 const PNL_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+// ── Leaderboard + AI agent pipeline ──────────────────────────────────────────
+let leaderboardWallets = {};   // address -> { rank, profit, label }
+let pendingTrades = [];        // whale trades queued for AI analysis
+const WHALE_MIN_SIZE = parseFloat(process.env.WHALE_MIN_SIZE || '500');
+const LEADERBOARD_SYNC_INTERVAL = 60 * 60 * 1000; // 1 hour
+const SCANNER_INTERVAL = 60 * 1000; // 1 minute
+
+// ── Co-trader discovery ───────────────────────────────────────────────────────
+let discoveredWallets = {};          // address -> { discoveredAt, discoveredVia, winRate, roi, tradeCount, label }
+const discoveryCache = {};           // conditionId -> timestamp (24h cooldown per market)
+let discoveredWalletsCol;            // MongoDB collection
+const DISCOVERY_COOLDOWN = 24 * 60 * 60 * 1000;  // 24h per market
+const MAX_DISCOVERED_WALLETS = 100;
+const MIN_TRADES_FOR_QUALITY = 10;   // wallet must have at least 10 closed trades
+const MIN_WIN_RATE_FOR_QUALITY = 52; // 52%+ win rate
 
 async function connectDB() {
   if (!MONGODB_URI) { console.warn('⚠️  No MONGODB_URI set'); return; }
@@ -33,8 +50,17 @@ async function connectDB() {
     await client.connect();
     const db = client.db('polywatch');
     walletsCol = db.collection('wallets');
+    signalsCol = db.collection('signals');
+    discoveredWalletsCol = db.collection('discovered_wallets');
     console.log('✅ MongoDB connected');
   } catch (e) { console.error('❌ MongoDB:', e.message); }
+}
+
+async function loadDiscoveredWallets() {
+  if (!discoveredWalletsCol) return;
+  const docs = await discoveredWalletsCol.find({}).toArray();
+  docs.forEach(w => { discoveredWallets[w.address] = w; });
+  console.log(`✅ Loaded ${docs.length} previously discovered wallet(s)`);
 }
 
 async function loadState() {
@@ -71,6 +97,9 @@ async function savePatternData(address) {
 function recordMarketTrade(address, trade) {
   const marketId = trade.conditionId || trade.market_id || trade.market;
   if (!marketId) return;
+
+  // Trigger co-trader discovery in background (non-blocking)
+  setImmediate(() => discoverCoTraders(marketId, address));
   if (!recentMarketTrades[marketId]) recentMarketTrades[marketId] = [];
   const now = Date.now();
   recentMarketTrades[marketId] = recentMarketTrades[marketId].filter(t => now - t.time < 7200000);
@@ -453,21 +482,212 @@ function startApiServer() {
         console.log(`🔗 /pnl endpoint called for ${a}, response:`, pnlData);
         return res.end(JSON.stringify(pnlData||{}));
       }
-      if (path==='/health') return res.end(JSON.stringify({status:'ok',tracked:Object.keys(state.wallets).length,uptime:process.uptime()}));
+      if (path==='/health') return res.end(JSON.stringify({status:'ok',tracked:Object.keys(state.wallets).length,leaderboard:Object.keys(leaderboardWallets).length,pendingTrades:pendingTrades.filter(t=>!t.analyzed).length,uptime:process.uptime()}));
+
+      // ── AI agent pipeline endpoints ─────────────────────────────────────────
+      if (path==='/leaderboard' && req.method==='GET') {
+        return res.end(JSON.stringify(
+          Object.entries(leaderboardWallets)
+            .map(([addr, data]) => ({ address: addr, ...data }))
+            .sort((a, b) => a.rank - b.rank)
+        ));
+      }
+
+      // /pending-trades returns both buffered whale trades AND recent consensus trades
+      // so the AI agents have real data even before manual wallets trigger events
+      if (path==='/pending-trades' && req.method==='GET') {
+        const unanalyzed = pendingTrades.filter(t => !t.analyzed);
+        // Also include recentMarketTrades flattened — the existing consensus data
+        const recentFlat = Object.entries(recentMarketTrades).flatMap(([marketId, trades]) =>
+          trades.map(t => ({ ...t, id: `rmt_${marketId}_${t.address}_${t.time}`, analyzed: false, source: 'consensus' }))
+        );
+        const combined = [...unanalyzed, ...recentFlat];
+        return res.end(JSON.stringify(combined));
+      }
+
+      if (path==='/signals' && req.method==='POST') {
+        const signal = JSON.parse(await readBody(req));
+        signal.createdAt = Date.now();
+        if (signalsCol) await signalsCol.insertOne(signal);
+        // Mark associated trades as analyzed
+        if (Array.isArray(signal.tradeIds)) {
+          signal.tradeIds.forEach(id => {
+            const t = pendingTrades.find(t => t.id === id);
+            if (t) t.analyzed = true;
+          });
+        }
+        // Telegram alert for high-confidence signals
+        if (bot && TELEGRAM_CHAT_ID && (signal.confidence || 0) >= 70) {
+          const emoji = signal.strategy === 'whale' ? '🐋' : signal.strategy === 'arbitrage' ? '⚡' : '🎯';
+          const msg = `${emoji} *AI Signal — ${(signal.strategy||'').toUpperCase()}*\n\n` +
+            `📊 _${(signal.market||'').slice(0,80)}_\n\n` +
+            `Direction: *${signal.direction}*\nConfidence: *${signal.confidence}%*\n\n` +
+            `${(signal.reasoning||'').slice(0,200)}`;
+          bot.sendMessage(TELEGRAM_CHAT_ID, msg, { parse_mode: 'Markdown' }).catch(() => {});
+        }
+        return res.end(JSON.stringify({ success: true }));
+      }
+
+      if (path==='/discovered-wallets' && req.method==='GET') {
+        return res.end(JSON.stringify(
+          Object.values(discoveredWallets).sort((a, b) => b.winRate - a.winRate)
+        ));
+      }
+
+      if (path==='/signals' && req.method==='GET') {
+        const limit = parseInt(url.searchParams.get('limit') || '20');
+        const signals = signalsCol
+          ? await signalsCol.find({}).sort({ createdAt: -1 }).limit(limit).toArray()
+          : [];
+        return res.end(JSON.stringify(signals));
+      }
       res.statusCode=404; res.end(JSON.stringify({error:'not found'}));
     } catch(e) { res.statusCode=500; res.end(JSON.stringify({error:e.message})); }
   }).listen(PORT, ()=>console.log(`✅ API server running on http://localhost:${PORT}`));
+}
+
+// ── Co-trader discovery ───────────────────────────────────────────────────────
+async function discoverCoTraders(conditionId, sourceAddress) {
+  if (!conditionId) return;
+
+  // 24h cooldown per market
+  const lastScanned = discoveryCache[conditionId];
+  if (lastScanned && Date.now() - lastScanned < DISCOVERY_COOLDOWN) return;
+  discoveryCache[conditionId] = Date.now();
+
+  if (Object.keys(discoveredWallets).length >= MAX_DISCOVERED_WALLETS) return;
+
+  try {
+    const r = await axios.get(`${DATA_API}/trades`, {
+      params: { market: conditionId, limit: 300 },
+      timeout: 12000
+    });
+    const trades = r.data || [];
+    if (!trades.length) return;
+
+    const candidates = [...new Set(
+      trades
+        .map(t => (t.proxyWallet || '').toLowerCase())
+        .filter(addr =>
+          addr && addr.startsWith('0x') &&
+          addr !== sourceAddress &&
+          !state.wallets[addr] &&
+          !discoveredWallets[addr]
+        )
+    )].slice(0, 15);
+
+    if (!candidates.length) return;
+    console.log(`🔍 Discovery: checking ${candidates.length} co-traders on ${conditionId.slice(0, 10)}...`);
+
+    let added = 0;
+    for (const addr of candidates) {
+      if (Object.keys(discoveredWallets).length >= MAX_DISCOVERED_WALLETS) break;
+
+      const pnl = await fetchPnL(addr);
+      await delay(300);
+
+      if (!pnl || pnl.tradeCount < MIN_TRADES_FOR_QUALITY) continue;
+      if (pnl.winRate < MIN_WIN_RATE_FOR_QUALITY) continue;
+
+      const entry = {
+        address: addr,
+        discoveredAt: Date.now(),
+        discoveredVia: conditionId,
+        winRate: parseFloat(pnl.winRate.toFixed(1)),
+        roi: parseFloat(pnl.roi.toFixed(1)),
+        tradeCount: pnl.tradeCount,
+        label: `Disc #${Object.keys(discoveredWallets).length + 1}`
+      };
+      discoveredWallets[addr] = entry;
+      if (discoveredWalletsCol) await discoveredWalletsCol.updateOne(
+        { address: addr }, { $set: entry }, { upsert: true }
+      );
+      leaderboardWallets[addr] = { rank: Object.keys(leaderboardWallets).length + 1, profit: pnl.roi, label: entry.label };
+      added++;
+      console.log(`✅ Discovered: ${addr.slice(0, 10)}... winRate:${pnl.winRate.toFixed(1)}% ROI:${pnl.roi.toFixed(1)}% trades:${pnl.tradeCount}`);
+    }
+    if (added > 0) console.log(`🌐 +${added} wallet(s) added to pool (${Object.keys(discoveredWallets).length}/${MAX_DISCOVERED_WALLETS})`);
+  } catch (e) {
+    console.warn('⚠️  Co-trader discovery error:', e.message);
+  }
+}
+
+// ── Leaderboard: tracked + discovered wallets ─────────────────────────────────
+async function syncLeaderboard() {
+  leaderboardWallets = {};
+  // Seed from manually tracked wallets
+  Object.entries(state.wallets).forEach(([addr, w], i) => {
+    leaderboardWallets[addr] = { rank: i + 1, profit: 0, label: w.label };
+  });
+  // Include previously discovered wallets
+  Object.entries(discoveredWallets).forEach(([addr, w]) => {
+    if (!leaderboardWallets[addr]) {
+      leaderboardWallets[addr] = { rank: Object.keys(leaderboardWallets).length + 1, profit: w.roi || 0, label: w.label };
+    }
+  });
+  console.log(`📊 Scanner pool: ${Object.keys(leaderboardWallets).length} wallets (${Object.keys(state.wallets).length} tracked + ${Object.keys(discoveredWallets).length} discovered)`);
+}
+
+// ── Global whale scanner ──────────────────────────────────────────────────────
+async function scanLeaderboardActivity() {
+  const addresses = Object.keys(leaderboardWallets);
+  if (!addresses.length) return;
+
+  let newCount = 0;
+  const seenIds = new Set(pendingTrades.map(t => t.id));
+
+  // Scan top 20 to avoid rate limits
+  for (const address of addresses.slice(0, 20)) {
+    const trades = await fetchActivity(address, 5);
+    for (const trade of trades) {
+      const size = parseFloat(trade.size || trade.usdcSize || 0);
+      if (size < WHALE_MIN_SIZE) continue;
+
+      const tradeId = `${address}_${trade.id || trade.timestamp}`;
+      if (seenIds.has(tradeId)) continue;
+
+      seenIds.add(tradeId);
+      pendingTrades.push({
+        id: tradeId,
+        address,
+        rank: leaderboardWallets[address]?.rank,
+        walletLabel: leaderboardWallets[address]?.label,
+        side: trade.side,
+        outcome: trade.outcomeIndex === 0 ? 'YES' : 'NO',
+        price: parseFloat(trade.price || 0),
+        size,
+        conditionId: trade.conditionId,
+        market: trade.title || trade.market || trade.conditionId || 'Unknown',
+        timestamp: trade.timestamp || Date.now(),
+        analyzed: false
+      });
+      newCount++;
+    }
+    await delay(200);
+  }
+
+  // Cap buffer at 500
+  if (pendingTrades.length > 500) pendingTrades = pendingTrades.slice(-500);
+  if (newCount > 0) console.log(`🔍 Scanner: ${newCount} new whale trade(s) queued (${pendingTrades.filter(t => !t.analyzed).length} pending analysis)`);
 }
 
 async function main() {
   console.log('🔮 PolyWatch starting...\n');
   await connectDB();
   await loadState();
+  await loadDiscoveredWallets();
   initTelegram();
   startApiServer();
   await pollAll();
   setInterval(pollAll, POLL_INTERVAL_MS);
-  console.log(`\n✅ Polling every ${POLL_INTERVAL_MS/1000}s. Waiting for trades...\n`);
+
+  // Leaderboard sync + whale scanner
+  await syncLeaderboard();
+  setInterval(syncLeaderboard, LEADERBOARD_SYNC_INTERVAL);
+  await scanLeaderboardActivity();
+  setInterval(scanLeaderboardActivity, SCANNER_INTERVAL);
+
+  console.log(`\n✅ Polling every ${POLL_INTERVAL_MS/1000}s | Scanner every ${SCANNER_INTERVAL/1000}s | Leaderboard syncs hourly\n`);
 }
 
 main().catch(console.error);
