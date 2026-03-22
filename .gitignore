@@ -26,3 +26,8 @@ Thumbs.db
 # Data
 data/
 *.db
+
+# Python
+agents/.env
+agents/__pycache__/
+*.pyc

@@ -1,0 +1,33 @@
+name: PolyWatch Agent Swarm
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # every 30 minutes, 24/7
+  workflow_dispatch:           # manual trigger from GitHub UI anytime
+
+jobs:
+  run-agents:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10        # kill if agents hang
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: agents/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r agents/requirements.txt
+
+      - name: Run agent swarm (single pass)
+        run: python agents/analyst.py
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}
+          MIN_CONFIDENCE: '50'
+          MAX_RUNS_PER_DAY: '999'   # GitHub Actions handles scheduling
