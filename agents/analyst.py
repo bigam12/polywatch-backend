@@ -29,10 +29,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BACKEND_URL = os.getenv('BACKEND_URL', 'http://localhost:3001')
+BACKEND_URL      = os.getenv('BACKEND_URL', 'http://localhost:3001')
 ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
-LOOP_INTERVAL  = int(os.getenv('LOOP_INTERVAL', '300'))   # seconds between runs
-MIN_CONFIDENCE = int(os.getenv('MIN_CONFIDENCE', '50'))   # only post signals above this
+TELEGRAM_TOKEN   = os.getenv('TELEGRAM_TOKEN', '')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
+LOOP_INTERVAL    = int(os.getenv('LOOP_INTERVAL', '300'))   # seconds between runs
+MIN_CONFIDENCE   = int(os.getenv('MIN_CONFIDENCE', '50'))   # only post signals above this
 MAX_RUNS_PER_DAY = int(os.getenv('MAX_RUNS_PER_DAY', '48'))  # default: every 30min max
 
 _runs_today = 0
@@ -66,6 +68,30 @@ def fmt_trades(markets_dict: dict) -> str:
                 f"{t['side']} {t['outcome']} at {round(t['price']*100)}¢  (${t['size']:,.0f})"
             )
     return '\n'.join(lines)
+
+
+# ── Backend wake-up ───────────────────────────────────────────────────────────
+
+async def wake_backend(session: aiohttp.ClientSession) -> bool:
+    """Ping /health with retries to wake Render from sleep (cold start takes ~30-50s)."""
+    print("⏰ Waking backend (Render free tier sleeps after 15 min)...")
+    for attempt in range(3):
+        try:
+            async with session.get(
+                f'{BACKEND_URL}/health',
+                timeout=aiohttp.ClientTimeout(total=60)
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    print(f"✅ Backend alive (wallets: {data.get('wallets', '?')}, pending: {data.get('pendingTrades', '?')})")
+                    return True
+        except Exception as e:
+            if attempt < 2:
+                print(f"  Retry {attempt + 1}/3... ({e})")
+                await asyncio.sleep(3)
+            else:
+                print(f"❌ Backend unreachable after 3 attempts: {e}")
+    return False
 
 
 # ── Agent 1: Whale Convergence ────────────────────────────────────────────────
@@ -271,6 +297,132 @@ Return ONLY a JSON object:
     return result
 
 
+# ── Agent 4: Signal Auditor (daily, 9am UTC) ─────────────────────────────────
+
+async def auditor_agent(session: aiohttp.ClientSession) -> None:
+    """
+    Fetches the last 100 signals, checks how many resolved markets played out
+    correctly, then sends a per-strategy win-rate report to Telegram.
+    Runs once per day (caller checks hour == 9 UTC).
+    """
+    print("  [auditor_agent] Fetching signals for audit...")
+
+    try:
+        async with session.get(
+            f'{BACKEND_URL}/signals?limit=100',
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            signals = await r.json()
+    except Exception as e:
+        print(f"  [auditor_agent] Could not fetch signals: {e}")
+        return
+
+    if not signals:
+        print("  [auditor_agent] No signals to audit yet.")
+        return
+
+    stats: dict[str, dict] = {
+        'whale':          {'w': 0, 'l': 0},
+        'near_certainty': {'w': 0, 'l': 0},
+        'arbitrage':      {'w': 0, 'l': 0},
+    }
+    total_checked = 0
+
+    for sig in signals:
+        slug      = sig.get('slug', '')
+        cid       = sig.get('conditionId', '')
+        direction = sig.get('direction', '')
+        strategy  = sig.get('strategy', '')
+
+        # Arbitrage is multi-outcome — resolution logic is complex, skip for now
+        if direction == 'ALL_YES' or strategy not in stats or not (slug or cid):
+            continue
+
+        try:
+            params = {'slug': slug} if slug else {'condition_ids': cid}
+            async with session.get(
+                f'{GAMMA_API}/markets',
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                data = await r.json()
+
+            market = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else None)
+            if not market:
+                continue
+
+            # Only grade resolved markets
+            if market.get('active', True) or not market.get('closed', False):
+                continue
+
+            raw      = market.get('outcomePrices', '[]')
+            prices   = [float(p) for p in raw.strip('[]').split(',')]
+            outcomes = market.get('outcomes', ['Yes', 'No'])
+
+            if len(prices) < 2:
+                continue
+
+            yes_idx   = next((i for i, o in enumerate(outcomes) if str(o).lower() in ('yes', 'true')), 0)
+            yes_price = prices[yes_idx]
+
+            if direction == 'YES':
+                won = yes_price >= 0.95
+            elif direction == 'NO':
+                won = yes_price <= 0.05
+            else:
+                continue
+
+            stats[strategy]['w' if won else 'l'] += 1
+            total_checked += 1
+
+        except Exception:
+            continue
+
+    if total_checked == 0:
+        print("  [auditor_agent] No resolved signals yet — markets still open.")
+        return
+
+    # Build report
+    overall_w = sum(v['w'] for v in stats.values())
+    overall_l = sum(v['l'] for v in stats.values())
+    overall_pct = round(overall_w / (overall_w + overall_l) * 100) if (overall_w + overall_l) else 0
+
+    lines = [
+        f"📊 *PolyWatch Daily Audit — {datetime.utcnow().strftime('%b %d, %Y')}*\n",
+        f"Resolved signals: *{total_checked}*  |  Overall: *{overall_w}W/{overall_l}L* ({overall_pct}%)\n",
+    ]
+    labels = {'whale': '🐋 Whale', 'near_certainty': '🎯 Contrarian', 'arbitrage': '⚡ Arbitrage'}
+    for strat, r in stats.items():
+        total = r['w'] + r['l']
+        if total == 0:
+            continue
+        pct   = round(r['w'] / total * 100)
+        bar   = '█' * round(pct / 10) + '░' * (10 - round(pct / 10))
+        flag  = '  ⚠️ underperforming' if pct < 45 else ''
+        lines.append(f"{labels[strat]}: {r['w']}W/{r['l']}L ({pct}%) {bar}{flag}")
+
+    report = '\n'.join(lines)
+    print(f"  [auditor_agent]\n{report}")
+
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("  [auditor_agent] ⚠️  TELEGRAM_TOKEN/CHAT_ID not set — add to .env and GitHub Secrets")
+        return
+
+    try:
+        async with session.post(
+            f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
+            json={'chat_id': TELEGRAM_CHAT_ID, 'text': report, 'parse_mode': 'Markdown'},
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            resp = await r.json()
+            if resp.get('ok'):
+                print("  [auditor_agent] ✅ Audit report sent to Telegram")
+            else:
+                print(f"  [auditor_agent] ❌ Telegram error: {resp.get('description', resp)}")
+    except Exception as e:
+        print(f"  [auditor_agent] ❌ Failed to send: {e}")
+
+
 # ── Swarm Orchestrator ────────────────────────────────────────────────────────
 
 async def run_swarm():
@@ -279,16 +431,19 @@ async def run_swarm():
     print(f"{'='*60}")
 
     async with aiohttp.ClientSession() as session:
+        # Wake up Render (free tier sleeps after 15 min; cold start takes ~30-50s)
+        if not await wake_backend(session):
+            return
+
         # Fetch pending whale trades from backend
         try:
             async with session.get(
                 f'{BACKEND_URL}/pending-trades',
-                timeout=aiohttp.ClientTimeout(total=10)
+                timeout=aiohttp.ClientTimeout(total=15)
             ) as r:
                 pending_trades = await r.json()
         except Exception as e:
-            print(f"❌ Could not reach backend at {BACKEND_URL}: {e}")
-            print("   Make sure tracker.js is running.")
+            print(f"❌ Could not fetch pending trades: {e}")
             return
 
         print(f"📥 {len(pending_trades)} pending whale trades to analyze")
@@ -325,7 +480,7 @@ async def run_swarm():
                 async with session.post(
                     f'{BACKEND_URL}/signals',
                     json=result,
-                    timeout=aiohttp.ClientTimeout(total=10)
+                    timeout=aiohttp.ClientTimeout(total=30)
                 ) as r:
                     if r.status == 200:
                         signals_posted += 1
@@ -336,6 +491,11 @@ async def run_swarm():
                 print(f"               ❌ Failed to post: {e}")
 
         print(f"\n🏁 Done — {signals_posted}/3 signals posted\n")
+
+        # Run daily audit once at 9am UTC (GitHub Actions cron fires at :00 and :30)
+        if datetime.utcnow().hour == 9:
+            print("🔍 9am UTC — running daily performance audit...")
+            await auditor_agent(session)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

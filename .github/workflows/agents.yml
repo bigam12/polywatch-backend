@@ -29,5 +29,7 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           BACKEND_URL: ${{ secrets.BACKEND_URL }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MIN_CONFIDENCE: '50'
           MAX_RUNS_PER_DAY: '999'   # GitHub Actions handles scheduling
