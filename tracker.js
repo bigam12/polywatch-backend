@@ -44,6 +44,14 @@ const MAX_DISCOVERED_WALLETS = 100;
 const MIN_TRADES_FOR_QUALITY = 10;   // wallet must have at least 10 closed trades
 const MIN_WIN_RATE_FOR_QUALITY = 52; // 52%+ win rate
 
+// ── Daily Alpha Picks scanner ─────────────────────────────────────────────────
+let dailyPicksCol;
+let dailyScanResult = null;
+let lastDailyScanTime = 0;
+let scanInProgress = false;
+const DAILY_SCAN_INTERVAL = 6 * 60 * 60 * 1000; // every 6 hours
+const SCAN_MIN_COOLDOWN = 60 * 1000; // minimum 1 min between scans
+
 async function connectDB() {
   if (!MONGODB_URI) { console.warn('⚠️  No MONGODB_URI set'); return; }
   try {
@@ -53,6 +61,7 @@ async function connectDB() {
     walletsCol = db.collection('wallets');
     signalsCol = db.collection('signals');
     discoveredWalletsCol = db.collection('discovered_wallets');
+    dailyPicksCol = db.collection('daily_picks');
     console.log('✅ MongoDB connected');
   } catch (e) { console.error('❌ MongoDB:', e.message); }
 }
@@ -163,6 +172,14 @@ function updatePattern(address, trade) {
     p.tag = earlyRate >= 0.4 ? 'sharp' : earlyRate >= 0.2 ? 'mixed' : 'follower';
   }
   savePatternData(address);
+}
+
+function computeGrade(winRate, roi) {
+  if (winRate > 65 && roi > 20) return 'S';
+  if (winRate > 55 && roi > 10) return 'A';
+  if (winRate > 45) return 'B';
+  if (winRate > 35) return 'C';
+  return 'D';
 }
 
 function checkEntryPriceAlert(address, trade) {
@@ -567,6 +584,34 @@ function startApiServer() {
         if (!signals.length) signals = signalsCache.slice(0, limit);
         return res.end(JSON.stringify(signals));
       }
+      if (path === '/daily-picks' && req.method === 'GET') {
+        // Return cached result if fresh (< 6h)
+        if (dailyScanResult && Date.now() - lastDailyScanTime < DAILY_SCAN_INTERVAL) {
+          return res.end(JSON.stringify(dailyScanResult));
+        }
+        // Load latest from MongoDB if available
+        if (dailyPicksCol) {
+          try {
+            const latest = await dailyPicksCol.find({}).sort({ scannedAt: -1 }).limit(1).toArray();
+            if (latest.length && Date.now() - latest[0].scannedAt < DAILY_SCAN_INTERVAL) {
+              dailyScanResult = latest[0];
+              lastDailyScanTime = latest[0].scannedAt;
+              const { _id, ...rest } = dailyScanResult;
+              return res.end(JSON.stringify(rest));
+            }
+          } catch (e) { console.warn('⚠️  Daily picks DB read failed:', e.message); }
+        }
+        // Trigger fresh scan (non-blocking, return current state)
+        runDailyScan().catch(e => console.warn('Scan error:', e.message));
+        return res.end(JSON.stringify({ scannedAt: null, scanned: 0, passed: 0, picks: [], scanning: true }));
+      }
+
+      if (path === '/daily-picks' && req.method === 'POST') {
+        if (scanInProgress) return res.end(JSON.stringify({ success: false, message: 'Scan already in progress' }));
+        runDailyScan().catch(e => console.warn('Scan error:', e.message));
+        return res.end(JSON.stringify({ success: true, message: 'Scan started' }));
+      }
+
       res.statusCode=404; res.end(JSON.stringify({error:'not found'}));
     } catch(e) { res.statusCode=500; res.end(JSON.stringify({error:e.message})); }
   }).listen(PORT, ()=>console.log(`✅ API server running on http://localhost:${PORT}`));
@@ -654,6 +699,96 @@ async function syncLeaderboard() {
   console.log(`📊 Scanner pool: ${Object.keys(leaderboardWallets).length} wallets (${Object.keys(state.wallets).length} tracked + ${Object.keys(discoveredWallets).length} discovered)`);
 }
 
+// ── Daily Alpha Picks scanner ─────────────────────────────────────────────────
+async function runDailyScan() {
+  if (scanInProgress) { console.log('⏭️  Scan already in progress, skipping'); return dailyScanResult; }
+  if (Date.now() - lastDailyScanTime < SCAN_MIN_COOLDOWN) { console.log('⏭️  Scan too recent, skipping'); return dailyScanResult; }
+  scanInProgress = true;
+  console.log('🎯 Daily scan starting...');
+
+  // Build wallet pool from tracked + discovered wallets
+  const pool = new Set([
+    ...Object.keys(state.wallets),
+    ...Object.keys(discoveredWallets)
+  ]);
+
+  // Try to fetch additional top earners from Polymarket data API
+  try {
+    const r = await axios.get(`${DATA_API}/earnings`, {
+      params: { limit: 500, window: '1w' },
+      timeout: 15000
+    });
+    const earners = Array.isArray(r.data) ? r.data : [];
+    earners.forEach(e => {
+      const addr = (e.proxyWallet || e.address || '').toLowerCase();
+      if (addr.startsWith('0x')) pool.add(addr);
+    });
+    console.log(`📊 Earnings API added wallets, pool size: ${pool.size}`);
+  } catch (e) {
+    console.log(`⚠️  Earnings API unavailable (${e.message}), using local pool (${pool.size} wallets)`);
+  }
+
+  const poolArr = [...pool];
+  const scanned = poolArr.length;
+  const results = [];
+
+  for (const addr of poolArr) {
+    try {
+      const pnl = await fetchPnL(addr);
+      await delay(150);
+      if (!pnl || pnl.tradeCount < 10) continue;
+      if (pnl.winRate < 52) continue;
+
+      // Score: win rate (45%) + capped ROI (35%) + activity (20%)
+      const winScore = pnl.winRate;
+      const roiScore = Math.min(Math.max(pnl.roi, 0), 300) / 300 * 100;
+      const actScore = Math.min(pnl.tradeCount / 50, 1) * 100;
+      const score = Math.round(winScore * 0.45 + roiScore * 0.35 + actScore * 0.20);
+
+      const label = state.wallets[addr]?.label || discoveredWallets[addr]?.label || addr.slice(0, 8) + '...';
+      results.push({
+        address: addr,
+        label,
+        score,
+        winRate: parseFloat(pnl.winRate.toFixed(1)),
+        roi: parseFloat(pnl.roi.toFixed(1)),
+        profit: parseFloat((pnl.profit || 0).toFixed(2)),
+        tradeCount: pnl.tradeCount,
+        wins: pnl.wins,
+        losses: pnl.losses,
+        grade: computeGrade(pnl.winRate, pnl.roi)
+      });
+    } catch (e) { /* skip bad wallets */ }
+  }
+
+  results.sort((a, b) => b.score - a.score);
+  const passed = results.length;
+  const picks = results.slice(0, 10);
+  const avgROI = picks.length ? parseFloat((picks.reduce((s, p) => s + p.roi, 0) / picks.length).toFixed(1)) : 0;
+  const bestROI = picks.length ? Math.max(...picks.map(p => p.roi)) : 0;
+
+  const scanResult = {
+    scannedAt: Date.now(),
+    scanned,
+    passed,
+    avgROI,
+    bestROI: parseFloat(bestROI.toFixed(1)),
+    picks
+  };
+
+  dailyScanResult = scanResult;
+  lastDailyScanTime = Date.now();
+
+  if (dailyPicksCol) {
+    try { await dailyPicksCol.insertOne({ ...scanResult }); }
+    catch (e) { console.warn('⚠️  Daily scan save failed:', e.message); }
+  }
+
+  console.log(`✅ Daily scan: ${scanned} scanned, ${passed} passed filters, top score: ${picks[0]?.score || 0}`);
+  scanInProgress = false;
+  return scanResult;
+}
+
 // ── Global whale scanner ──────────────────────────────────────────────────────
 async function scanLeaderboardActivity() {
   const addresses = Object.keys(leaderboardWallets);
@@ -712,6 +847,12 @@ async function main() {
   setInterval(syncLeaderboard, LEADERBOARD_SYNC_INTERVAL);
   await scanLeaderboardActivity();
   setInterval(scanLeaderboardActivity, SCANNER_INTERVAL);
+
+  // Daily alpha picks scanner (runs every 6h)
+  setTimeout(async () => {
+    await runDailyScan();
+    setInterval(runDailyScan, DAILY_SCAN_INTERVAL);
+  }, 5000); // delay 5s after startup to not overload
 
   console.log(`\n✅ Polling every ${POLL_INTERVAL_MS/1000}s | Scanner every ${SCANNER_INTERVAL/1000}s | Leaderboard syncs hourly\n`);
 }
