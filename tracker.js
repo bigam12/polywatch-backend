@@ -706,26 +706,34 @@ async function runDailyScan() {
   scanInProgress = true;
   console.log('🎯 Daily scan starting...');
 
-  // Build wallet pool from tracked + discovered wallets
+  // Build wallet pool: start with tracked + discovered wallets
   const pool = new Set([
     ...Object.keys(state.wallets),
     ...Object.keys(discoveredWallets)
   ]);
+  const leaderboardNames = {}; // addr -> userName from leaderboard
 
-  // Try to fetch additional top earners from Polymarket data API
+  // Fetch top 500 from Polymarket leaderboard (paginate 10 × 50)
   try {
-    const r = await axios.get(`${DATA_API}/earnings`, {
-      params: { limit: 500, window: '1w' },
-      timeout: 15000
-    });
-    const earners = Array.isArray(r.data) ? r.data : [];
-    earners.forEach(e => {
-      const addr = (e.proxyWallet || e.address || '').toLowerCase();
-      if (addr.startsWith('0x')) pool.add(addr);
-    });
-    console.log(`📊 Earnings API added wallets, pool size: ${pool.size}`);
+    for (let offset = 0; offset < 500; offset += 50) {
+      const r = await axios.get(`${DATA_API}/v1/leaderboard`, {
+        params: { limit: 50, offset, timePeriod: 'WEEK', orderBy: 'PNL' },
+        timeout: 10000
+      });
+      const entries = Array.isArray(r.data) ? r.data : [];
+      entries.forEach(e => {
+        const addr = (e.proxyWallet || '').toLowerCase();
+        if (addr.startsWith('0x')) {
+          pool.add(addr);
+          if (e.userName) leaderboardNames[addr] = e.userName;
+        }
+      });
+      if (entries.length < 50) break; // no more pages
+      await delay(200);
+    }
+    console.log(`📊 Leaderboard fetched, pool size: ${pool.size}`);
   } catch (e) {
-    console.log(`⚠️  Earnings API unavailable (${e.message}), using local pool (${pool.size} wallets)`);
+    console.log(`⚠️  Leaderboard API failed (${e.message}), using local pool (${pool.size} wallets)`);
   }
 
   const poolArr = [...pool];
@@ -745,7 +753,7 @@ async function runDailyScan() {
       const actScore = Math.min(pnl.tradeCount / 50, 1) * 100;
       const score = Math.round(winScore * 0.45 + roiScore * 0.35 + actScore * 0.20);
 
-      const label = state.wallets[addr]?.label || discoveredWallets[addr]?.label || addr.slice(0, 8) + '...';
+      const label = state.wallets[addr]?.label || discoveredWallets[addr]?.label || leaderboardNames[addr] || addr.slice(0, 8) + '...';
       results.push({
         address: addr,
         label,
