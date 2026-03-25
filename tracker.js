@@ -363,8 +363,6 @@ async function fetchPnL(address) {
     const weekly  = computeStats(closedPositions.filter(p => p.timestamp >= now - 604800));
     const daily   = computeStats(closedPositions.filter(p => p.timestamp >= now - 86400));
 
-    console.log('📊 PnL:', { closedCount: closedPositions.length, alltime: { winRate: alltime.winRate.toFixed(1), wins: alltime.wins, losses: alltime.losses }, monthly: { wins: monthly.wins, losses: monthly.losses }, weekly: { wins: weekly.wins }, daily: { wins: daily.wins } });
-
     const result = {
       ...alltime,
       portfolioValue,
@@ -705,6 +703,7 @@ async function runDailyScan() {
   if (Date.now() - lastDailyScanTime < SCAN_MIN_COOLDOWN) { console.log('⏭️  Scan too recent, skipping'); return dailyScanResult; }
   scanInProgress = true;
   console.log('🎯 Daily scan starting...');
+  try {
 
   // Build wallet pool: start with tracked + discovered wallets
   const pool = new Set([
@@ -739,8 +738,14 @@ async function runDailyScan() {
   const poolArr = [...pool];
   const scanned = poolArr.length;
   const results = [];
+  const SCAN_TIMEOUT_MS = 12 * 60 * 1000; // 12-minute wall-clock limit
+  const scanStart = Date.now();
 
   for (const addr of poolArr) {
+    if (Date.now() - scanStart > SCAN_TIMEOUT_MS) {
+      console.warn(`⏱️ Scan timeout after 12m — processed ${results.length} qualifying wallets from ${poolArr.indexOf(addr)}/${scanned}`);
+      break;
+    }
     try {
       const pnl = await fetchPnL(addr);
       await delay(150);
@@ -793,8 +798,13 @@ async function runDailyScan() {
   }
 
   console.log(`✅ Daily scan: ${scanned} scanned, ${passed} passed filters, top score: ${picks[0]?.score || 0}`);
-  scanInProgress = false;
   return scanResult;
+  } catch (e) {
+    console.error('❌ Daily scan failed:', e);
+    return dailyScanResult;
+  } finally {
+    scanInProgress = false;
+  }
 }
 
 // ── Global whale scanner ──────────────────────────────────────────────────────
