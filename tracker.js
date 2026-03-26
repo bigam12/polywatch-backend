@@ -582,6 +582,32 @@ function startApiServer() {
         if (!signals.length) signals = signalsCache.slice(0, limit);
         return res.end(JSON.stringify(signals));
       }
+      if (path === '/wallet-profile' && req.method === 'GET') {
+        const addr = url.searchParams.get('address')?.toLowerCase();
+        if (!addr) { res.statusCode = 400; return res.end(JSON.stringify({ error: 'address required' })); }
+        try {
+          const [closedPositions, activity] = await Promise.all([
+            fetchClosedPositions(addr),
+            fetchActivity(addr, 50)
+          ]);
+          const conditionIds = [...new Set(closedPositions.map(p => p.conditionId).filter(Boolean))];
+          const marketTitles = await fetchMarketQuestions(conditionIds);
+          const breakdown = closedPositions.slice(0, 30).map(p => ({
+            conditionId: p.conditionId,
+            question: marketTitles[p.conditionId] || 'Unknown market',
+            side: parseInt(p.outcomeIndex) === 0 ? 'YES' : 'NO',
+            invested: parseFloat((parseFloat(p.totalBought) || 0).toFixed(2)),
+            pnl: parseFloat((parseFloat(p.realizedPnl) || 0).toFixed(2)),
+            roi: parseFloat(p.totalBought) > 0 ? parseFloat(((parseFloat(p.realizedPnl) / parseFloat(p.totalBought)) * 100).toFixed(1)) : 0,
+            won: parseFloat(p.realizedPnl || 0) > 0.01,
+            resolvedAt: p.timestamp
+          }));
+          const buys = activity.filter(t => t.side === 'BUY');
+          const labels = computeLabels(buys, closedPositions);
+          return res.end(JSON.stringify({ labels, breakdown }));
+        } catch(e) { res.statusCode = 500; return res.end(JSON.stringify({ error: e.message })); }
+      }
+
       if (path === '/daily-picks' && req.method === 'GET') {
         // Return cached result if fresh (< 6h)
         if (dailyScanResult && Date.now() - lastDailyScanTime < DAILY_SCAN_INTERVAL) {
@@ -695,6 +721,56 @@ async function syncLeaderboard() {
     }
   });
   console.log(`📊 Scanner pool: ${Object.keys(leaderboardWallets).length} wallets (${Object.keys(state.wallets).length} tracked + ${Object.keys(discoveredWallets).length} discovered)`);
+}
+
+// ── Wallet profiling helpers ──────────────────────────────────────────────────
+async function fetchMarketQuestions(conditionIds) {
+  if (!conditionIds.length) return {};
+  try {
+    const r = await axios.get(`${GAMMA_API}/markets`, {
+      params: { condition_ids: conditionIds.slice(0, 50).join(',') },
+      timeout: 10000
+    });
+    const map = {};
+    (r.data || []).forEach(m => { if (m.conditionId) map[m.conditionId] = m.question; });
+    return map;
+  } catch(e) { return {}; }
+}
+
+function computeLabels(buys, closedPositions) {
+  const labels = [];
+  if (buys.length < 5) return labels;
+
+  // YES vs NO bias
+  const noBuys = buys.filter(t => parseInt(t.outcomeIndex) === 1).length;
+  const noRatio = noBuys / buys.length;
+  if (noRatio >= 0.60) labels.push('NO Fader');
+  else if (noRatio <= 0.35) labels.push('YES Buyer');
+
+  // Avg entry price
+  const prices = buys.map(t => parseFloat(t.price || 0)).filter(p => p > 0 && p < 1);
+  if (prices.length >= 5) {
+    const avg = prices.reduce((s, p) => s + p, 0) / prices.length;
+    if (avg >= 0.68) labels.push('Late Entry');
+    else if (avg <= 0.38) labels.push('Early Bird');
+  }
+
+  // Contrarian: bets NO against heavy favorites (NO price < 30¢ = YES > 70¢)
+  if (buys.length >= 10) {
+    const contr = buys.filter(t => parseInt(t.outcomeIndex) === 1 && parseFloat(t.price || 0) < 0.30);
+    if (contr.length / buys.length >= 0.35) labels.push('Contrarian');
+  }
+
+  // Volume / selectivity
+  const total = closedPositions.length;
+  if (total >= 150) {
+    labels.push('High Volume');
+  } else if (total >= 8 && total <= 35) {
+    const wins = closedPositions.filter(p => parseFloat(p.realizedPnl || 0) > 0.01).length;
+    if (wins / total >= 0.62) labels.push('Selective');
+  }
+
+  return labels;
 }
 
 // ── Daily Alpha Picks scanner ─────────────────────────────────────────────────
