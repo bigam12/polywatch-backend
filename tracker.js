@@ -591,10 +591,10 @@ function startApiServer() {
             fetchActivity(addr, 50)
           ]);
           const conditionIds = [...new Set(closedPositions.map(p => (p.conditionId || p.market || '').toLowerCase()).filter(Boolean))];
-          const marketTitles = await fetchMarketQuestions(conditionIds);
+          const { questions: marketTitles, tags: marketTags } = await fetchMarketQuestions(conditionIds);
           const breakdown = closedPositions.slice(0, 30).map(p => ({
             conditionId: p.conditionId,
-            question: marketTitles[(p.conditionId || p.market || '').toLowerCase()] || 'Unknown market',
+            question: p.question || p.title || marketTitles[(p.conditionId || p.market || '').toLowerCase()] || 'Unknown market',
             side: parseInt(p.outcomeIndex) === 0 ? 'YES' : 'NO',
             invested: parseFloat((parseFloat(p.totalBought) || 0).toFixed(2)),
             pnl: parseFloat((parseFloat(p.realizedPnl) || 0).toFixed(2)),
@@ -604,7 +604,8 @@ function startApiServer() {
           }));
           const buys = activity.filter(t => t.side === 'BUY');
           const labels = computeLabels(buys, closedPositions);
-          return res.end(JSON.stringify({ labels, breakdown }));
+          const topCategories = computeTopCategories(breakdown, marketTags);
+          return res.end(JSON.stringify({ labels, breakdown, topCategories }));
         } catch(e) { res.statusCode = 500; return res.end(JSON.stringify({ error: e.message })); }
       }
 
@@ -725,20 +726,41 @@ async function syncLeaderboard() {
 
 // ── Wallet profiling helpers ──────────────────────────────────────────────────
 async function fetchMarketQuestions(conditionIds) {
-  if (!conditionIds.length) return {};
+  if (!conditionIds.length) return { questions: {}, tags: {} };
   const normalised = conditionIds.map(id => id.toLowerCase());
   try {
     const r = await axios.get(`${GAMMA_API}/markets`, {
       params: { condition_ids: normalised.slice(0, 50).join(',') },
       timeout: 10000
     });
-    const map = {};
+    const questions = {}, tags = {};
     (r.data || []).forEach(m => {
       const key = (m.conditionId || m.condition_id || '').toLowerCase();
-      if (key) map[key] = m.question;
+      if (!key) return;
+      questions[key] = m.question;
+      tags[key] = (m.tags || []).map(t => (typeof t === 'string' ? t : t.label || t.name || '').trim()).filter(Boolean);
     });
-    return map;
-  } catch(e) { return {}; }
+    return { questions, tags };
+  } catch(e) { return { questions: {}, tags: {} }; }
+}
+
+function computeTopCategories(breakdown, marketTags) {
+  const stats = {}; // normalizedName -> { display, wins, total }
+  breakdown.forEach(p => {
+    const key = (p.conditionId || '').toLowerCase();
+    const tagList = marketTags[key] || [];
+    tagList.forEach(rawTag => {
+      const norm = rawTag.toLowerCase();
+      if (!stats[norm]) stats[norm] = { display: rawTag, wins: 0, total: 0 };
+      stats[norm].total++;
+      if (p.won) stats[norm].wins++;
+    });
+  });
+  return Object.values(stats)
+    .filter(s => s.total >= 2)
+    .map(s => ({ name: s.display, wins: s.wins, total: s.total, winRate: Math.round((s.wins / s.total) * 100) }))
+    .sort((a, b) => b.winRate - a.winRate || b.total - a.total)
+    .slice(0, 3);
 }
 
 function computeLabels(buys, closedPositions) {
