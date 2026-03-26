@@ -533,12 +533,14 @@ function startApiServer() {
           try { await signalsCol.insertOne({ ...signal }); }
           catch(e) { console.warn('⚠️  Signal MongoDB save failed:', e.message); }
         }
-        // Mark associated trades as analyzed
+        // Mark associated trades as analyzed + capture wallet addresses
         if (Array.isArray(signal.tradeIds)) {
+          const walletSet = new Set();
           signal.tradeIds.forEach(id => {
             const t = pendingTrades.find(t => t.id === id);
-            if (t) t.analyzed = true;
+            if (t) { t.analyzed = true; if (t.address) walletSet.add(t.address); }
           });
+          if (walletSet.size) signal.wallets = [...walletSet];
         }
         // Telegram alert for high-confidence signals
         if (bot && TELEGRAM_CHAT_ID && (signal.confidence || 0) >= 70) {
@@ -582,6 +584,39 @@ function startApiServer() {
         if (!signals.length) signals = signalsCache.slice(0, limit);
         return res.end(JSON.stringify(signals));
       }
+
+      if (path === '/signal-positions' && req.method === 'GET') {
+        const conditionId = url.searchParams.get('conditionId')?.toLowerCase();
+        const walletParam = url.searchParams.get('wallets') || '';
+        const wallets = walletParam.split(',').map(w => w.trim().toLowerCase()).filter(Boolean);
+        if (!conditionId || !wallets.length) { res.statusCode = 400; return res.end(JSON.stringify({ error: 'conditionId and wallets required' })); }
+        try {
+          const results = await Promise.all(wallets.map(async addr => {
+            const label = (state.wallets[addr] || leaderboardWallets[addr] || {}).label || addr.slice(0,8);
+            const [positions, activity] = await Promise.all([
+              fetchPositions(addr),
+              fetchActivity(addr, 30)
+            ]);
+            // Check open positions for this market
+            const openPos = positions.find(p => (p.conditionId || p.market || p.condition_id || '').toLowerCase() === conditionId);
+            // Check recent sells in this market
+            const sells = activity.filter(t =>
+              t.side === 'SELL' &&
+              (t.conditionId || t.market || t.condition_id || '').toLowerCase() === conditionId
+            );
+            if (openPos && parseFloat(openPos.size || openPos.currentValue || 0) > 0.01) {
+              return { address: addr, label, status: 'holding', size: parseFloat(openPos.size || openPos.currentValue || 0) };
+            } else if (sells.length) {
+              const avgExit = sells.reduce((s, t) => s + parseFloat(t.price || 0), 0) / sells.length;
+              return { address: addr, label, status: 'exited', exitPrice: parseFloat((avgExit * 100).toFixed(1)) };
+            } else {
+              return { address: addr, label, status: 'unknown' };
+            }
+          }));
+          return res.end(JSON.stringify(results));
+        } catch(e) { res.statusCode = 500; return res.end(JSON.stringify({ error: e.message })); }
+      }
+
       if (path === '/wallet-profile' && req.method === 'GET') {
         const addr = url.searchParams.get('address')?.toLowerCase();
         if (!addr) { res.statusCode = 400; return res.end(JSON.stringify({ error: 'address required' })); }
@@ -593,7 +628,7 @@ function startApiServer() {
           const conditionIds = [...new Set(closedPositions.map(p => (p.conditionId || p.market || '').toLowerCase()).filter(Boolean))];
           const { questions: marketTitles, tags: marketTags } = await fetchMarketQuestions(conditionIds);
           const breakdown = closedPositions.slice(0, 30).map(p => ({
-            conditionId: p.conditionId,
+            conditionId: (p.conditionId || p.market || '').toLowerCase(),
             question: p.question || p.title || marketTitles[(p.conditionId || p.market || '').toLowerCase()] || 'Unknown market',
             side: parseInt(p.outcomeIndex) === 0 ? 'YES' : 'NO',
             invested: parseFloat((parseFloat(p.totalBought) || 0).toFixed(2)),
@@ -738,7 +773,11 @@ async function fetchMarketQuestions(conditionIds) {
       const key = (m.conditionId || m.condition_id || '').toLowerCase();
       if (!key) return;
       questions[key] = m.question;
-      tags[key] = (m.tags || []).map(t => (typeof t === 'string' ? t : t.label || t.name || '').trim()).filter(Boolean);
+      const rawTags = m.tags && m.tags.length ? m.tags : (m.category ? [m.category] : []);
+      tags[key] = rawTags.map(t => {
+        const s = (typeof t === 'string' ? t : t.label || t.name || '').trim();
+        return s.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+      }).filter(Boolean);
     });
     return { questions, tags };
   } catch(e) { return { questions: {}, tags: {} }; }
