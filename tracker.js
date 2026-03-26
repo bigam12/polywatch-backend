@@ -465,9 +465,9 @@ function startApiServer() {
         if (state.wallets[addr]) { res.statusCode=409; return res.end(JSON.stringify({error:'Already tracking'})); }
         const walletLabel = label || `Wallet ${Object.keys(state.wallets).length+1}`;
         const data = { label:walletLabel, addedAt:Date.now(), alerts:true, threshold:parseFloat(threshold)||MIN_TRADE_SIZE_USD };
+        try { await saveWallet(addr, data); } catch(e) { res.statusCode=500; return res.end(JSON.stringify({error:'DB unavailable — wallet not saved, try again'})); }
         state.wallets[addr]=data; state.lastSeen[addr]=null;
         patternData[addr] = { earlyEntries:0, totalTrades:0, avgEntryPrice:0, tag:'unknown' };
-        await saveWallet(addr, data);
         console.log(`➕ Tracking: ${walletLabel}`);
         bot?.sendMessage(TELEGRAM_CHAT_ID, `✅ *Now tracking: ${walletLabel}*\n\`${addr}\``, { parse_mode:'Markdown' }).catch(()=>{});
         return res.end(JSON.stringify({success:true,address:addr,label:walletLabel}));
@@ -716,7 +716,7 @@ async function runDailyScan() {
   try {
     for (let offset = 0; offset < 500; offset += 50) {
       const r = await axios.get(`${DATA_API}/v1/leaderboard`, {
-        params: { limit: 50, offset, timePeriod: 'WEEK', orderBy: 'PNL' },
+        params: { limit: 50, offset, timePeriod: 'ALL', orderBy: 'PNL' },
         timeout: 10000
       });
       const entries = Array.isArray(r.data) ? r.data : [];
