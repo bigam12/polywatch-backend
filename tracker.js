@@ -590,11 +590,11 @@ function startApiServer() {
             fetchClosedPositions(addr),
             fetchActivity(addr, 50)
           ]);
-          const conditionIds = [...new Set(closedPositions.map(p => p.conditionId).filter(Boolean))];
+          const conditionIds = [...new Set(closedPositions.map(p => (p.conditionId || p.market || '').toLowerCase()).filter(Boolean))];
           const marketTitles = await fetchMarketQuestions(conditionIds);
           const breakdown = closedPositions.slice(0, 30).map(p => ({
             conditionId: p.conditionId,
-            question: marketTitles[p.conditionId] || 'Unknown market',
+            question: marketTitles[(p.conditionId || p.market || '').toLowerCase()] || 'Unknown market',
             side: parseInt(p.outcomeIndex) === 0 ? 'YES' : 'NO',
             invested: parseFloat((parseFloat(p.totalBought) || 0).toFixed(2)),
             pnl: parseFloat((parseFloat(p.realizedPnl) || 0).toFixed(2)),
@@ -726,13 +726,17 @@ async function syncLeaderboard() {
 // ── Wallet profiling helpers ──────────────────────────────────────────────────
 async function fetchMarketQuestions(conditionIds) {
   if (!conditionIds.length) return {};
+  const normalised = conditionIds.map(id => id.toLowerCase());
   try {
     const r = await axios.get(`${GAMMA_API}/markets`, {
-      params: { condition_ids: conditionIds.slice(0, 50).join(',') },
+      params: { condition_ids: normalised.slice(0, 50).join(',') },
       timeout: 10000
     });
     const map = {};
-    (r.data || []).forEach(m => { if (m.conditionId) map[m.conditionId] = m.question; });
+    (r.data || []).forEach(m => {
+      const key = (m.conditionId || m.condition_id || '').toLowerCase();
+      if (key) map[key] = m.question;
+    });
     return map;
   } catch(e) { return {}; }
 }
