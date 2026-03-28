@@ -756,7 +756,16 @@ async function syncLeaderboard() {
       leaderboardWallets[addr] = { rank: Object.keys(leaderboardWallets).length + 1, profit: w.roi || 0, label: w.label };
     }
   });
-  console.log(`📊 Scanner pool: ${Object.keys(leaderboardWallets).length} wallets (${Object.keys(state.wallets).length} tracked + ${Object.keys(discoveredWallets).length} discovered)`);
+  // Include top wallets from the latest daily scan (top 500 leaderboard picks)
+  if (dailyScanResult?.picks) {
+    dailyScanResult.picks.forEach(w => {
+      if (!leaderboardWallets[w.address]) {
+        leaderboardWallets[w.address] = { rank: Object.keys(leaderboardWallets).length + 1, profit: w.roi || 0, label: w.label, fromDailyScan: true };
+      }
+    });
+  }
+  const picksCount = (dailyScanResult?.picks || []).filter(w => !state.wallets[w.address] && !discoveredWallets[w.address]).length;
+  console.log(`📊 Scanner pool: ${Object.keys(leaderboardWallets).length} wallets (${Object.keys(state.wallets).length} tracked + ${Object.keys(discoveredWallets).length} discovered + ${picksCount} daily picks)`);
 }
 
 // ── Wallet profiling helpers ──────────────────────────────────────────────────
@@ -956,8 +965,15 @@ async function scanLeaderboardActivity() {
   let newCount = 0;
   const seenIds = new Set(pendingTrades.map(t => t.id));
 
-  // Scan top 20 to avoid rate limits
-  for (const address of addresses.slice(0, 20)) {
+  // Prioritise: daily picks first (highest-quality wallets from 500-wallet scan),
+  // then tracked/discovered — cap at 50 total to stay within rate limits
+  const picksSet = new Set((dailyScanResult?.picks || []).map(p => p.address));
+  const prioritized = [
+    ...addresses.filter(a => picksSet.has(a)),
+    ...addresses.filter(a => !picksSet.has(a))
+  ].slice(0, 50);
+
+  for (const address of prioritized) {
     const trades = await fetchActivity(address, 5);
     for (const trade of trades) {
       const size = parseFloat(trade.size || trade.usdcSize || 0);
