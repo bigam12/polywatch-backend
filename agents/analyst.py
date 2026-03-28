@@ -380,6 +380,25 @@ async def auditor_agent(session: aiohttp.ClientSession) -> None:
 
     if total_checked == 0:
         print("  [auditor_agent] No resolved signals yet — markets still open.")
+        # Still send a heartbeat so you know the audit ran
+        if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+            msg = (
+                f"📊 *PolyWatch Daily Audit — {datetime.utcnow().strftime('%b %d, %Y')}*\n\n"
+                f"Signals in DB: *{len(signals)}*\n"
+                f"Resolved markets: *0* — markets still open\n\n"
+                f"_Win/loss tracking begins once your first market resolves._"
+            )
+            try:
+                async with session.post(
+                    f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
+                    json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg, 'parse_mode': 'Markdown'},
+                    timeout=aiohttp.ClientTimeout(total=15)
+                ) as r:
+                    resp = await r.json()
+                    if resp.get('ok'):
+                        print("  [auditor_agent] ✅ Heartbeat sent to Telegram")
+            except Exception as e:
+                print(f"  [auditor_agent] ❌ Failed to send heartbeat: {e}")
         return
 
     # Build report
