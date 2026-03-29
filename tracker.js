@@ -14,6 +14,7 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '15000');
 const MIN_TRADE_SIZE_USD = parseFloat(process.env.MIN_TRADE_SIZE_USD || '50');
 const MONGODB_URI = process.env.MONGODB_URI;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
 const DATA_API = 'https://data-api.polymarket.com';
 const GAMMA_API = 'https://gamma-api.polymarket.com';
@@ -34,6 +35,8 @@ let signalsCache = [];         // in-memory fallback for signals (last 100)
 const WHALE_MIN_SIZE = parseFloat(process.env.WHALE_MIN_SIZE || '500');
 const LEADERBOARD_SYNC_INTERVAL = 60 * 60 * 1000; // 1 hour
 const SCANNER_INTERVAL = 60 * 1000; // 1 minute
+const whaleCooldown = {};      // conditionId -> timestamp (2h cooldown per market)
+const WHALE_COOLDOWN_MS = 2 * 60 * 60 * 1000;
 
 // ── Co-trader discovery ───────────────────────────────────────────────────────
 let discoveredWallets = {};          // address -> { discoveredAt, discoveredVia, winRate, roi, tradeCount, label }
@@ -957,6 +960,121 @@ async function runDailyScan() {
   }
 }
 
+// ── Inline whale agent (event-driven, fires immediately on convergence) ───────
+async function runInlineWhaleAgent(newTrades) {
+  if (!ANTHROPIC_API_KEY) return;
+
+  // Group new trades by market, find convergent ones (2+ wallets same side)
+  const byMarket = {};
+  for (const t of newTrades) {
+    const key = t.conditionId || t.market || 'unknown';
+    if (key === 'unknown') continue;
+    (byMarket[key] = byMarket[key] || []).push(t);
+  }
+
+  const convergent = {};
+  for (const [market, trades] of Object.entries(byMarket)) {
+    // Skip if still in cooldown for this market
+    if (whaleCooldown[market] && Date.now() - whaleCooldown[market] < WHALE_COOLDOWN_MS) continue;
+
+    const yesWallets = new Set(trades.filter(t => t.outcome === 'YES' && t.side === 'BUY').map(t => t.address));
+    const noWallets  = new Set(trades.filter(t => t.outcome === 'NO'  && t.side === 'BUY').map(t => t.address));
+    if (yesWallets.size >= 2 || noWallets.size >= 2) {
+      convergent[market] = trades;
+    }
+  }
+
+  if (!Object.keys(convergent).length) return;
+
+  // Format trades for the prompt (mirrors analyst.py fmt_trades)
+  const tradeLines = Object.entries(convergent).map(([market, trades]) => {
+    const header = `\nMarket: ${market.slice(0, 80)}`;
+    const rows = trades.map(t =>
+      `  Rank #${t.rank || '?'} (${t.walletLabel || '?'}): ${t.side} ${t.outcome} at ${Math.round(t.price * 100)}¢  ($${Math.round(t.size).toLocaleString()})`
+    );
+    return [header, ...rows].join('\n');
+  }).join('\n');
+
+  const allTradeIds = Object.values(convergent).flat().map(t => t.id);
+  const now = new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+
+  const prompt = `You are a Polymarket trading analyst. Multiple top-ranked traders have converged on the same market.
+
+Recent whale trades (wallets are ranked by weekly profit on Polymarket leaderboard):
+${tradeLines}
+
+Today: ${now}
+
+Identify the SINGLE best trading opportunity from this data. Return ONLY a JSON object:
+{
+  "market": "full market question",
+  "direction": "YES" or "NO",
+  "confidence": <integer 0-100>,
+  "reasoning": "<2-3 sentences explaining the signal>",
+  "trade_ids": ${JSON.stringify(allTradeIds)}
+}`;
+
+  try {
+    const resp = await axios.post(
+      'https://api.anthropic.com/v1/messages',
+      { model: 'claude-haiku-4-5-20251001', max_tokens: 400, messages: [{ role: 'user', content: prompt }] },
+      { headers: { 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }, timeout: 30000 }
+    );
+
+    const text = resp.data?.content?.[0]?.text || '';
+    const m = text.match(/\{[\s\S]*\}/);
+    if (!m) return;
+    const signal = JSON.parse(m[0]);
+    if (!signal || !signal.market) return;
+
+    signal.strategy = 'whale';
+    signal.createdAt = Date.now();
+
+    // Match conditionId back to the signal
+    const picked = signal.market || '';
+    for (const [key, trades] of Object.entries(convergent)) {
+      if (key.slice(0, 60).includes(picked.slice(0, 60)) || picked.slice(0, 60).includes(key.slice(0, 60))) {
+        signal.conditionId = trades[0]?.conditionId || key;
+        whaleCooldown[key] = Date.now();
+        break;
+      }
+    }
+    // Fallback: stamp all convergent markets as cooled down
+    for (const key of Object.keys(convergent)) whaleCooldown[key] = Date.now();
+
+    // Mark trades as analyzed and collect wallet addresses
+    const walletSet = new Set();
+    (signal.trade_ids || []).forEach(id => {
+      const t = pendingTrades.find(t => t.id === id);
+      if (t) { t.analyzed = true; walletSet.add(t.address); }
+    });
+    if (walletSet.size) signal.wallets = [...walletSet];
+
+    const conf = signal.confidence || 0;
+    if (conf < 50) { console.log(`  [inline_whale] Signal below threshold (${conf}%) — skipped`); return; }
+
+    signalsCache.unshift(signal);
+    if (signalsCache.length > 100) signalsCache = signalsCache.slice(0, 100);
+    if (signalsCol) {
+      try { await signalsCol.insertOne({ ...signal }); } catch(e) { console.warn('⚠️  Signal save failed:', e.message); }
+    }
+
+    console.log(`  [inline_whale] ✅ Signal posted immediately: ${signal.market?.slice(0, 60)} (${conf}%)`);
+
+    // Telegram alert
+    if (bot && TELEGRAM_CHAT_ID && conf >= 70) {
+      const dirEmoji = signal.direction === 'YES' ? '🟢' : '🔴';
+      const bar = '█'.repeat(Math.round(conf / 10)) + '░'.repeat(10 - Math.round(conf / 10));
+      const slug = signal.slug || '';
+      const url = slug ? `https://polymarket.com/event/${slug}` : `https://polymarket.com/search?q=${encodeURIComponent((signal.market||'').slice(0,50))}`;
+      const msg = `🐋 *WHALE CONVERGENCE* _(instant)_\n\n📊 _${(signal.market||'').slice(0,90)}_\n\n${dirEmoji} Trade: *${signal.direction}*\nConfidence: *${conf}%*  ${bar}\n\n💡 ${(signal.reasoning||'').slice(0,220)}\n\n[👉 Trade on Polymarket](${url})`;
+      bot.sendMessage(TELEGRAM_CHAT_ID, msg, { parse_mode: 'Markdown', disable_web_page_preview: false }).catch(() => {});
+    }
+  } catch(e) {
+    console.warn(`  [inline_whale] ⚠️  Agent call failed: ${e.message}`);
+  }
+}
+
 // ── Global whale scanner ──────────────────────────────────────────────────────
 async function scanLeaderboardActivity() {
   const addresses = Object.keys(leaderboardWallets);
@@ -1004,7 +1122,12 @@ async function scanLeaderboardActivity() {
 
   // Cap buffer at 500
   if (pendingTrades.length > 500) pendingTrades = pendingTrades.slice(-500);
-  if (newCount > 0) console.log(`🔍 Scanner: ${newCount} new whale trade(s) queued (${pendingTrades.filter(t => !t.analyzed).length} pending analysis)`);
+  if (newCount > 0) {
+    console.log(`🔍 Scanner: ${newCount} new whale trade(s) queued (${pendingTrades.filter(t => !t.analyzed).length} pending analysis)`);
+    // Fire inline whale agent immediately — don't wait for GitHub Actions
+    const newest = pendingTrades.filter(t => !t.analyzed).slice(-newCount);
+    runInlineWhaleAgent(newest).catch(() => {});
+  }
 }
 
 async function main() {
