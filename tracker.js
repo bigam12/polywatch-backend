@@ -52,8 +52,10 @@ let dailyPicksCol;
 let dailyScanResult = null;
 let lastDailyScanTime = 0;
 let scanInProgress = false;
-const DAILY_SCAN_INTERVAL = 6 * 60 * 60 * 1000; // every 6 hours
+const DAILY_SCAN_INTERVAL = 3 * 60 * 60 * 1000; // every 3 hours
 const SCAN_MIN_COOLDOWN = 60 * 1000; // minimum 1 min between scans
+const SCAN_TIME_PERIODS = ['WEEK', 'MONTH', 'ALL']; // rotates each run
+let scanPeriodIndex = 0; // increments after each completed scan
 
 async function connectDB() {
   if (!MONGODB_URI) { console.warn('⚠️  No MONGODB_URI set'); return; }
@@ -850,12 +852,34 @@ function computeLabels(buys, closedPositions) {
   return labels;
 }
 
+// ── Category enrichment for picks ────────────────────────────────────────────
+async function enrichPicksWithCategories(picks) {
+  return Promise.all(picks.map(async pick => {
+    try {
+      const r = await axios.get(`${DATA_API}/closed-positions`, {
+        params: { user: pick.address, limit: 50, offset: 0, sortBy: 'TIMESTAMP', sortDirection: 'DESC' },
+        timeout: 8000
+      });
+      const positions = r.data || [];
+      const conditionIds = [...new Set(positions.map(p => (p.conditionId || p.market || '').toLowerCase()).filter(Boolean))];
+      if (!conditionIds.length) return { ...pick, topCategories: [] };
+      const { tags } = await fetchMarketQuestions(conditionIds);
+      const breakdown = positions.map(p => ({
+        conditionId: (p.conditionId || p.market || '').toLowerCase(),
+        won: parseFloat(p.realizedPnl || 0) > 0.01
+      }));
+      return { ...pick, topCategories: computeTopCategories(breakdown, tags) };
+    } catch(e) { return { ...pick, topCategories: [] }; }
+  }));
+}
+
 // ── Daily Alpha Picks scanner ─────────────────────────────────────────────────
 async function runDailyScan() {
   if (scanInProgress) { console.log('⏭️  Scan already in progress, skipping'); return dailyScanResult; }
   if (Date.now() - lastDailyScanTime < SCAN_MIN_COOLDOWN) { console.log('⏭️  Scan too recent, skipping'); return dailyScanResult; }
   scanInProgress = true;
-  console.log('🎯 Daily scan starting...');
+  const timePeriod = SCAN_TIME_PERIODS[scanPeriodIndex % 3];
+  console.log(`🎯 Daily scan starting... period: ${timePeriod}`);
   try {
 
   // Build wallet pool: start with tracked + discovered wallets
@@ -865,25 +889,28 @@ async function runDailyScan() {
   ]);
   const leaderboardNames = {}; // addr -> userName from leaderboard
 
-  // Fetch top 500 from Polymarket leaderboard (paginate 10 × 50)
+  // Fetch top 300 by PNL + top 300 by WINRATE for current period, in parallel
   try {
-    for (let offset = 0; offset < 500; offset += 50) {
-      const r = await axios.get(`${DATA_API}/v1/leaderboard`, {
-        params: { limit: 50, offset, timePeriod: 'ALL', orderBy: 'PNL' },
-        timeout: 10000
-      });
-      const entries = Array.isArray(r.data) ? r.data : [];
-      entries.forEach(e => {
-        const addr = (e.proxyWallet || '').toLowerCase();
-        if (addr.startsWith('0x')) {
-          pool.add(addr);
-          if (e.userName) leaderboardNames[addr] = e.userName;
-        }
-      });
-      if (entries.length < 50) break; // no more pages
-      await delay(200);
-    }
-    console.log(`📊 Leaderboard fetched, pool size: ${pool.size}`);
+    const fetchLeaderboardPages = async (orderBy) => {
+      for (let offset = 0; offset < 300; offset += 50) {
+        const r = await axios.get(`${DATA_API}/v1/leaderboard`, {
+          params: { limit: 50, offset, timePeriod, orderBy },
+          timeout: 10000
+        });
+        const entries = Array.isArray(r.data) ? r.data : [];
+        entries.forEach(e => {
+          const addr = (e.proxyWallet || '').toLowerCase();
+          if (addr.startsWith('0x')) {
+            pool.add(addr);
+            if (e.userName && !leaderboardNames[addr]) leaderboardNames[addr] = e.userName;
+          }
+        });
+        if (entries.length < 50) break;
+        await delay(150);
+      }
+    };
+    await Promise.all([fetchLeaderboardPages('PNL'), fetchLeaderboardPages('WINRATE')]);
+    console.log(`📊 Leaderboard (${timePeriod}) fetched, pool: ${pool.size} wallets`);
   } catch (e) {
     console.log(`⚠️  Leaderboard API failed (${e.message}), using local pool (${pool.size} wallets)`);
   }
@@ -902,13 +929,20 @@ async function runDailyScan() {
     try {
       const pnl = await fetchPnL(addr);
       await delay(150);
-      if (!pnl || pnl.tradeCount < 10) continue;
-      if (pnl.winRate < 52) continue;
+      if (!pnl) continue;
+
+      // Use period-matched stats so weekly scan scores weekly performance, not all-time
+      const periodKey = timePeriod === 'WEEK' ? 'weekly' : timePeriod === 'MONTH' ? 'monthly' : 'alltime';
+      const stats = pnl.periods?.[periodKey] || pnl;
+      const minTrades = timePeriod === 'WEEK' ? 3 : timePeriod === 'MONTH' ? 5 : 10;
+      if (stats.tradeCount < minTrades) continue;
+      if (stats.winRate < 52) continue;
 
       // Score: win rate (45%) + capped ROI (35%) + activity (20%)
-      const winScore = pnl.winRate;
-      const roiScore = Math.min(Math.max(pnl.roi, 0), 300) / 300 * 100;
-      const actScore = Math.min(pnl.tradeCount / 50, 1) * 100;
+      const winScore = stats.winRate;
+      const roiScore = Math.min(Math.max(stats.roi, 0), 300) / 300 * 100;
+      const actCap = timePeriod === 'WEEK' ? 7 : timePeriod === 'MONTH' ? 20 : 50;
+      const actScore = Math.min(stats.tradeCount / actCap, 1) * 100;
       const score = Math.round(winScore * 0.45 + roiScore * 0.35 + actScore * 0.20);
 
       const label = state.wallets[addr]?.label || discoveredWallets[addr]?.label || leaderboardNames[addr] || addr.slice(0, 8) + '...';
@@ -916,22 +950,25 @@ async function runDailyScan() {
         address: addr,
         label,
         score,
-        winRate: parseFloat(pnl.winRate.toFixed(1)),
-        roi: parseFloat(pnl.roi.toFixed(1)),
-        profit: parseFloat((pnl.profit || 0).toFixed(2)),
-        tradeCount: pnl.tradeCount,
-        wins: pnl.wins,
-        losses: pnl.losses,
-        grade: computeGrade(pnl.winRate, pnl.roi)
+        winRate: parseFloat(stats.winRate.toFixed(1)),
+        roi: parseFloat(stats.roi.toFixed(1)),
+        profit: parseFloat((stats.profit || 0).toFixed(2)),
+        tradeCount: stats.tradeCount,
+        wins: stats.wins,
+        losses: stats.losses,
+        grade: computeGrade(stats.winRate, stats.roi)
       });
     } catch (e) { /* skip bad wallets */ }
   }
 
   results.sort((a, b) => b.score - a.score);
   const passed = results.length;
-  const picks = results.slice(0, 10);
-  const avgROI = picks.length ? parseFloat((picks.reduce((s, p) => s + p.roi, 0) / picks.length).toFixed(1)) : 0;
-  const bestROI = picks.length ? Math.max(...picks.map(p => p.roi)) : 0;
+  const rawPicks = results.slice(0, 10);
+  const avgROI = rawPicks.length ? parseFloat((rawPicks.reduce((s, p) => s + p.roi, 0) / rawPicks.length).toFixed(1)) : 0;
+  const bestROI = rawPicks.length ? Math.max(...rawPicks.map(p => p.roi)) : 0;
+
+  // Enrich top 10 with market categories (parallel, 1 API call each)
+  const picks = await enrichPicksWithCategories(rawPicks);
 
   const scanResult = {
     scannedAt: Date.now(),
@@ -939,11 +976,13 @@ async function runDailyScan() {
     passed,
     avgROI,
     bestROI: parseFloat(bestROI.toFixed(1)),
+    timePeriod,
     picks
   };
 
   dailyScanResult = scanResult;
   lastDailyScanTime = Date.now();
+  scanPeriodIndex++; // advance period for next run (WEEK → MONTH → ALL → WEEK...)
 
   if (dailyPicksCol) {
     try { await dailyPicksCol.insertOne({ ...scanResult }); }
