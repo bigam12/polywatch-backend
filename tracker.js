@@ -728,7 +728,12 @@ function startApiServer() {
               walletCount: new Set(recent.map(t => t.address)).size,
               convergent: yesWallets.size >= 2 || noWallets.size >= 2,
               direction: yesWallets.size >= noWallets.size ? 'YES' : 'NO',
-              walletNames: [...new Set(recent.map(t => t.wallet))].slice(0, 3)
+              walletNames: [...new Set(recent.map(t => t.wallet))].slice(0, 3),
+              trades: recent.slice(-10).reverse().map(t => ({
+                wallet: t.wallet, address: t.address,
+                side: t.side, outcome: t.outcome,
+                price: t.price, size: t.size, time: t.time
+              }))
             };
           }
 
@@ -1270,6 +1275,7 @@ async function scanLeaderboardActivity() {
         timestamp: trade.timestamp || Date.now(),
         analyzed: false
       });
+      recordMarketTrade(address, trade);
       newCount++;
     }
     await delay(200);
