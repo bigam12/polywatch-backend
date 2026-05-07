@@ -57,18 +57,25 @@ const SCAN_MIN_COOLDOWN = 60 * 1000; // minimum 1 min between scans
 const SCAN_TIME_PERIODS = ['WEEK', 'MONTH', 'ALL']; // rotates each run
 let scanPeriodIndex = 0; // increments after each completed scan
 
-async function connectDB() {
+async function connectDB(retries = 5, delayMs = 3000) {
   if (!MONGODB_URI) { console.warn('⚠️  No MONGODB_URI set'); return; }
-  try {
-    const client = new MongoClient(MONGODB_URI);
-    await client.connect();
-    const db = client.db('polywatch');
-    walletsCol = db.collection('wallets');
-    signalsCol = db.collection('signals');
-    discoveredWalletsCol = db.collection('discovered_wallets');
-    dailyPicksCol = db.collection('daily_picks');
-    console.log('✅ MongoDB connected');
-  } catch (e) { console.error('❌ MongoDB:', e.message); }
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const client = new MongoClient(MONGODB_URI);
+      await client.connect();
+      const db = client.db('polywatch');
+      walletsCol = db.collection('wallets');
+      signalsCol = db.collection('signals');
+      discoveredWalletsCol = db.collection('discovered_wallets');
+      dailyPicksCol = db.collection('daily_picks');
+      console.log('✅ MongoDB connected');
+      return;
+    } catch (e) {
+      console.error(`❌ MongoDB attempt ${attempt}/${retries}: ${e.message}`);
+      if (attempt < retries) await new Promise(r => setTimeout(r, delayMs));
+    }
+  }
+  console.error('❌ MongoDB: all connection attempts failed — wallets will not persist');
 }
 
 async function loadDiscoveredWallets() {
@@ -90,7 +97,7 @@ async function loadState() {
 }
 
 async function saveWallet(address, data) {
-  if (!walletsCol) return;
+  if (!walletsCol) throw new Error('DB not connected');
   await walletsCol.updateOne({ address }, { $set: { address, ...data, lastSeen: state.lastSeen[address] || null } }, { upsert: true });
 }
 
@@ -495,6 +502,30 @@ function startApiServer() {
         return res.end(JSON.stringify({success:true}));
       }
       if (path==='/consensus') return res.end(JSON.stringify(recentMarketTrades));
+
+      if (path==='/live-trades' && req.method==='GET') {
+        const now = Date.now();
+        const cutoff = now - 7200000; // 2 hours
+        const flat = Object.entries(recentMarketTrades).flatMap(([marketId, trades]) => {
+          const recent = trades.filter(t => t.time > cutoff);
+          if (!recent.length) return [];
+          const yesWallets = new Set(recent.filter(t => t.side === 'BUY' && t.outcome === 'YES').map(t => t.address));
+          const noWallets  = new Set(recent.filter(t => t.side === 'BUY' && t.outcome === 'NO').map(t => t.address));
+          return recent.map(t => {
+            const convergentCount = t.outcome === 'YES' ? yesWallets.size : noWallets.size;
+            const convergent = t.side === 'BUY' && convergentCount >= 2;
+            const cached = pnlCache[t.address];
+            const pnl = cached && cached.expiry > now ? cached.data : null;
+            const winRate = pnl ? (pnl.periods?.alltime?.winRate ?? pnl.winRate ?? 0) : 0;
+            const roi     = pnl ? (pnl.periods?.alltime?.roi     ?? pnl.roi     ?? 0) : 0;
+            return { marketId, wallet: t.wallet, address: t.address, side: t.side, outcome: t.outcome,
+              price: t.price, size: t.size, time: t.time, market: t.market,
+              convergent, convergentCount, grade: computeGrade(winRate, roi), winRate, roi };
+          });
+        });
+        flat.sort((a, b) => b.time - a.time);
+        return res.end(JSON.stringify(flat.slice(0, 100)));
+      }
       if (path==='/activity') { const a=url.searchParams.get('address'); return res.end(JSON.stringify(a?await fetchActivity(a,20):[])); }
       if (path==='/positions') { const a=url.searchParams.get('address'); return res.end(JSON.stringify(a?await fetchPositions(a):[])); }
       if (path==='/pnl') {
