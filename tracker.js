@@ -750,12 +750,22 @@ function startApiServer() {
             if (m.endDate) daysLeft = Math.max(0, Math.ceil((new Date(m.endDate) - now) / 86400000));
             const rawTags = m.tags && m.tags.length ? m.tags : (m.category ? [m.category] : []);
             const category = rawTags.map(t => typeof t === 'string' ? t : (t.label || t.name || '')).filter(Boolean).slice(0, 2).join(', ');
+            // Direction: smart money direction if available, else value direction (higher upside)
+            const direction = sm ? sm.direction : (prob <= 0.5 ? 'YES' : 'NO');
+            // Token ID for price chart (first entry in clobTokenIds)
+            let tokenId = '';
+            try {
+              const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : (m.clobTokenIds || []);
+              tokenId = tokens[0] || '';
+            } catch {}
             return {
               conditionId, question: m.question || m.title || 'Unknown',
               slug: m.slug || '', category,
               prob: parseFloat(prob.toFixed(3)),
               volume24h: parseFloat(m.volume24hr || m.volume || 0),
-              daysLeft, strategies, smartMoney: sm
+              daysLeft, strategies, smartMoney: sm,
+              direction, tokenId,
+              endDate: m.endDate || null
             };
           }).filter(Boolean);
 
@@ -766,6 +776,20 @@ function startApiServer() {
             return b.volume24h - a.volume24h;
           });
           return res.end(JSON.stringify(enriched));
+        } catch(e) { res.statusCode = 500; return res.end(JSON.stringify({ error: e.message })); }
+      }
+
+      if (path === '/market-prices' && req.method === 'GET') {
+        const tokenId = url.searchParams.get('tokenId');
+        if (!tokenId) { res.statusCode = 400; return res.end(JSON.stringify({ error: 'tokenId required' })); }
+        try {
+          const endTs = Math.floor(Date.now() / 1000);
+          const startTs = endTs - (8 * 24 * 3600);
+          const r = await axios.get('https://clob.polymarket.com/prices-history', {
+            params: { market: tokenId, startTs, endTs, fidelity: 60 },
+            timeout: 8000
+          });
+          return res.end(JSON.stringify(r.data || []));
         } catch(e) { res.statusCode = 500; return res.end(JSON.stringify({ error: e.message })); }
       }
 
