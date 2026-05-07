@@ -708,6 +708,67 @@ function startApiServer() {
         return res.end(JSON.stringify({ success: true, message: 'Scan started' }));
       }
 
+      if (path === '/markets' && req.method === 'GET') {
+        try {
+          const resp = await axios.get(`${GAMMA_API}/markets`, {
+            params: { active: 'true', limit: 100, order: 'volume24hr', ascending: 'false' },
+            timeout: 12000
+          });
+          const markets = resp.data || [];
+          const now = Date.now();
+          const cutoff = now - 7200000;
+
+          const smIndex = {};
+          for (const [marketId, trades] of Object.entries(recentMarketTrades)) {
+            const recent = trades.filter(t => t.time > cutoff);
+            if (!recent.length) continue;
+            const yesWallets = new Set(recent.filter(t => t.side === 'BUY' && t.outcome === 'YES').map(t => t.address));
+            const noWallets  = new Set(recent.filter(t => t.side === 'BUY' && t.outcome === 'NO').map(t => t.address));
+            smIndex[marketId.toLowerCase()] = {
+              walletCount: new Set(recent.map(t => t.address)).size,
+              convergent: yesWallets.size >= 2 || noWallets.size >= 2,
+              direction: yesWallets.size >= noWallets.size ? 'YES' : 'NO',
+              walletNames: [...new Set(recent.map(t => t.wallet))].slice(0, 3)
+            };
+          }
+
+          const enriched = markets.map(m => {
+            const conditionId = (m.conditionId || m.condition_id || '').toLowerCase();
+            if (!conditionId) return null;
+            let prob = 0;
+            try {
+              const prices = (m.outcomePrices || '[]').trim().replace(/^\[|\]$/g, '').split(',').map(Number);
+              prob = prices[0] || 0;
+            } catch {}
+            const sm = smIndex[conditionId] || null;
+            const strategies = [];
+            if (sm) strategies.push('smart_money');
+            if (sm?.convergent) strategies.push('sniper');
+            if (prob >= 0.75) strategies.push('consensus');
+            if (prob <= 0.25 && sm) strategies.push('moonshot');
+            let daysLeft = null;
+            if (m.endDate) daysLeft = Math.max(0, Math.ceil((new Date(m.endDate) - now) / 86400000));
+            const rawTags = m.tags && m.tags.length ? m.tags : (m.category ? [m.category] : []);
+            const category = rawTags.map(t => typeof t === 'string' ? t : (t.label || t.name || '')).filter(Boolean).slice(0, 2).join(', ');
+            return {
+              conditionId, question: m.question || m.title || 'Unknown',
+              slug: m.slug || '', category,
+              prob: parseFloat(prob.toFixed(3)),
+              volume24h: parseFloat(m.volume24hr || m.volume || 0),
+              daysLeft, strategies, smartMoney: sm
+            };
+          }).filter(Boolean);
+
+          enriched.sort((a, b) => {
+            const aScore = (a.smartMoney ? 4 : 0) + (a.strategies.includes('sniper') ? 2 : 0);
+            const bScore = (b.smartMoney ? 4 : 0) + (b.strategies.includes('sniper') ? 2 : 0);
+            if (bScore !== aScore) return bScore - aScore;
+            return b.volume24h - a.volume24h;
+          });
+          return res.end(JSON.stringify(enriched));
+        } catch(e) { res.statusCode = 500; return res.end(JSON.stringify({ error: e.message })); }
+      }
+
       res.statusCode=404; res.end(JSON.stringify({error:'not found'}));
     } catch(e) { res.statusCode=500; res.end(JSON.stringify({error:e.message})); }
   }).listen(PORT, ()=>console.log(`✅ API server running on http://localhost:${PORT}`));
