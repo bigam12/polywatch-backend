@@ -742,8 +742,9 @@ function startApiServer() {
             if (!conditionId) return null;
             let prob = 0;
             try {
-              const prices = (m.outcomePrices || '[]').trim().replace(/^\[|\]$/g, '').split(',').map(Number);
-              prob = prices[0] || 0;
+              let prices = m.outcomePrices;
+              if (typeof prices === 'string') prices = JSON.parse(prices);
+              if (Array.isArray(prices) && prices.length) prob = parseFloat(prices[0]) || 0;
             } catch {}
             const sm = smIndex[conditionId] || null;
             const strategies = [];
