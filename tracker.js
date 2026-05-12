@@ -747,13 +747,16 @@ function startApiServer() {
               if (Array.isArray(prices) && prices.length) prob = parseFloat(prices[0]) || 0;
             } catch {}
             const sm = smIndex[conditionId] || null;
+            let daysLeft = null;
+            if (m.endDate) daysLeft = Math.max(0, Math.ceil((new Date(m.endDate) - now) / 86400000));
+            // Skip expired markets and essentially-resolved markets with no smart money signal
+            if (daysLeft === 0) return null;
+            if (!sm && (prob < 0.02 || prob > 0.98)) return null;
             const strategies = [];
             if (sm) strategies.push('smart_money');
             if (sm?.convergent) strategies.push('sniper');
             if (prob >= 0.75) strategies.push('consensus');
             if (prob <= 0.25 && sm) strategies.push('moonshot');
-            let daysLeft = null;
-            if (m.endDate) daysLeft = Math.max(0, Math.ceil((new Date(m.endDate) - now) / 86400000));
             const rawTags = m.tags && m.tags.length ? m.tags : (m.category ? [m.category] : []);
             const category = rawTags.map(t => typeof t === 'string' ? t : (t.label || t.name || '')).filter(Boolean).slice(0, 2).join(', ');
             // Direction: smart money direction if available, else value direction (higher upside)
