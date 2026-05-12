@@ -97,6 +97,7 @@ async function loadState() {
 }
 
 async function saveWallet(address, data) {
+  if (!walletsCol) await connectDB(2, 2000);
   if (!walletsCol) throw new Error('DB not connected');
   await walletsCol.updateOne({ address }, { $set: { address, ...data, lastSeen: state.lastSeen[address] || null } }, { upsert: true });
 }
@@ -477,9 +478,9 @@ function startApiServer() {
         if (state.wallets[addr]) { res.statusCode=409; return res.end(JSON.stringify({error:'Already tracking'})); }
         const walletLabel = label || `Wallet ${Object.keys(state.wallets).length+1}`;
         const data = { label:walletLabel, addedAt:Date.now(), alerts:true, threshold:parseFloat(threshold)||MIN_TRADE_SIZE_USD };
-        try { await saveWallet(addr, data); } catch(e) { res.statusCode=500; return res.end(JSON.stringify({error:'DB unavailable — wallet not saved, try again'})); }
         state.wallets[addr]=data; state.lastSeen[addr]=null;
         patternData[addr] = { earlyEntries:0, totalTrades:0, avgEntryPrice:0, tag:'unknown' };
+        try { await saveWallet(addr, data); } catch(e) { console.error('DB save failed for', addr, e.message); }
         console.log(`➕ Tracking: ${walletLabel}`);
         bot?.sendMessage(TELEGRAM_CHAT_ID, `✅ *Now tracking: ${walletLabel}*\n\`${addr}\``, { parse_mode:'Markdown' }).catch(()=>{});
         return res.end(JSON.stringify({success:true,address:addr,label:walletLabel}));
